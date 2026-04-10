@@ -4,7 +4,7 @@
 // @Boolean(label = "Maximum Intensity Projection", value = false) saveMIP
 
 // ------------------------------------------------------------------------------
-// Fiji Macro: MD HCS Stack Assembler (v1.0.0)
+// Fiji: MD HCS stack assembler (v1.0.0)
 // Created: 2026-04-10 | Updated: 2026-04-10
 // Author: thom.dehoog@zmb.uzh.ch | ZMB Center for Microscopy and Image Analysis, UZH
 //
