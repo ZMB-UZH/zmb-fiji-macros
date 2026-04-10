@@ -7,6 +7,24 @@ Assembles multi-channel stacks from individual TIF tiles exported by Molecular D
 - Auto-detects flat folders or `timepoint` subfolder structures
 - Groups tiles by well prefix from filename tags (`_w`, `_z`, `_s`)
 - Robust tag matching avoids false hits (e.g. `_s` inside `_seeding`)
+- Preserves spatial calibration and acquisition metadata (see below)
+
+## Metadata preserved
+
+The following metadata is read from the MetaSeries XML embedded in each tile and carried over to the output files:
+
+**Spatial calibration** (applied via `Image > Properties`):
+- Pixel size XY (from `spatial-calibration-x/y`)
+- Z-step (computed from `z-position` of consecutive slices)
+- Calibration unit
+
+**Acquisition metadata** (stored in image info, visible via `Image > Show Info...`):
+- Instrument and software version
+- Objective, numerical aperture, refractive index
+- Channel names, wavelengths, and exposure times
+- Acquisition timestamp
+
+This metadata is preserved in the TIFF files and readable by both Fiji (drag and drop) and Bio-Formats.
 
 ## Expected input filename patterns
 
