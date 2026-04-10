@@ -226,6 +226,7 @@ for (tp = 0; tp < numTP; tp++) {
             software = "";
             acqTime = "";
             channelInfo = "";
+            rawMetadata = "";
 
             for (w = 0; w < numC; w++) {
                 for (z = 0; z < numZ; z++) {
@@ -240,8 +241,9 @@ for (tp = 0; tp < numTP; tp++) {
                     // Read metadata from the active tile before opening the next
                     tileInfo = getMetadata("Info");
 
-                    // First tile (w0, z0): XY calibration + acquisition metadata
+                    // First tile (w0, z0): XY calibration + acquisition metadata + raw XML
                     if (w == 0 && z == 0) {
+                        rawMetadata = tileInfo;
                         if (parseXmlProp(tileInfo, "spatial-calibration-x")) pixelWidth = parseFloat(_xmlValue);
                         if (parseXmlProp(tileInfo, "spatial-calibration-y")) pixelHeight = parseFloat(_xmlValue);
                         if (parseXmlProp(tileInfo, "spatial-calibration-units")) calUnit = _xmlValue;
@@ -288,6 +290,7 @@ for (tp = 0; tp < numTP; tp++) {
             if (numZ > 1) metaSummary += "Z-step: " + zStep + " " + calUnit + "\n";
             if (acqTime != "") metaSummary += "Acquisition time: " + acqTime + "\n";
             metaSummary += "\n" + channelInfo;
+            metaSummary += "\n--- Original MetaSeries XML (from first tile) ---\n" + rawMetadata;
 
             // --- Assemble ---
             run("Images to Stack", "use");
@@ -298,6 +301,8 @@ for (tp = 0; tp < numTP; tp++) {
             hsID = getImageID();
 
             // Apply calibration
+            if (pixelWidth == 0 || pixelHeight == 0)
+                print("  WARNING: no spatial calibration found in tile metadata");
             if (pixelWidth > 0 && pixelHeight > 0) {
                 propString = "unit=" + calUnit + " pixel_width=" + pixelWidth + " pixel_height=" + pixelHeight;
                 if (zStep > 0) propString += " voxel_depth=" + zStep;
