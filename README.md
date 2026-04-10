@@ -2,9 +2,9 @@
 
 Fiji macros by the [ZMB Center for Microscopy and Image Analysis](https://www.zmb.uzh.ch), University of Zurich.
 
-## Macros
+## Stack assemblers
 
-### zmb_MD_HCS_stack_assembler.ijm
+### [zmb_MD_HCS_stack_assembler.ijm](stack-assemblers/molecular-devices-HCS/zmb_MD_HCS_stack_assembler.ijm)
 
 Assembles multi-channel stacks from individual TIF tiles exported by Molecular Devices ImageXpress (MD HCS). Outputs hyperstacks and/or maximum intensity projections.
 
