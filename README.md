@@ -2,29 +2,24 @@
 
 Fiji macros by the [ZMB Center for Microscopy and Image Analysis](https://www.zmb.uzh.ch), University of Zurich.
 
-## Stack assemblers
+## Contents
 
-### [zmb_MD_HCS_stack_assembler.ijm](stack-assemblers/molecular-devices-HCS/zmb_MD_HCS_stack_assembler.ijm)
+| Category | Instrument / system | Description |
+|----------|-------------------|-------------|
+| [Stack assemblers](stack-assemblers/) | [Molecular Devices HCS](stack-assemblers/molecular-devices-HCS/) | Assemble TIF tiles into hyperstacks and/or MIPs |
 
-Assembles multi-channel stacks from individual TIF tiles exported by Molecular Devices ImageXpress (MD HCS). Outputs hyperstacks and/or maximum intensity projections.
+## Getting started
 
-**Features**
-- Auto-detects flat folders or `timepoint` subfolder structures
-- Groups tiles by well prefix from filename tags (`_w`, `_z`, `_s`)
-- Robust tag matching avoids false hits (e.g. `_s` inside `_seeding`)
+1. Download the `.ijm` file for your instrument
+2. Open [Fiji](https://fiji.sc)
+3. Drag and drop the file onto the Fiji toolbar, or open via `Plugins > Macros > Run...`
 
-**Expected input filename patterns**
-```
-prefix_w0_z0.tif
-prefix_s0_w0_z0.tif
-```
+See the README in each macro folder for detailed usage instructions.
 
-**Output**
-- `outputDir/hyperstacks/` — multi-channel, multi-z-slice hyperstacks
-- `outputDir/MIPs/` — maximum intensity projections (multi-channel composites)
+## Contributing
 
-## Usage
+If you have a macro to add, please follow the header format used in existing macros and include a README in the macro folder.
 
-1. Open [Fiji](https://fiji.sc)
-2. Drag and drop the `.ijm` file onto the Fiji toolbar, or open via `Plugins > Macros > Run...`
-3. A dialog will prompt for input/output folders and output options
+## Contact
+
+[ZMB Center for Microscopy and Image Analysis](https://www.zmb.uzh.ch) — University of Zurich
