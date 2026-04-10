@@ -4,9 +4,9 @@ Fiji macros by the [ZMB Center for Microscopy and Image Analysis](https://www.zm
 
 ## Macros
 
-### zmb_MD_HCS_stack_builder.ijm
+### zmb_MD_HCS_stack_assembler.ijm
 
-Builds multi-channel stacks from individual TIF tiles exported by Molecular Devices ImageXpress (MD HCS). Outputs hyperstacks and/or maximum intensity projections.
+Assembles multi-channel stacks from individual TIF tiles exported by Molecular Devices ImageXpress (MD HCS). Outputs hyperstacks and/or maximum intensity projections.
 
 **Features**
 - Auto-detects flat folders or `timepoint` subfolder structures

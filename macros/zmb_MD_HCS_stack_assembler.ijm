@@ -4,13 +4,13 @@
 // @Boolean(label = "Maximum Intensity Projection", value = false) saveMIP
 
 // ------------------------------------------------------------------------------
-// Fiji Macro: MD HCS Stack Builder (v1.0.0)
+// Fiji Macro: MD HCS Stack Assembler (v1.0.0)
 // Created: 2026-04-10 | Updated: 2026-04-10
 // Author: thom.dehoog@zmb.uzh.ch | ZMB Center for Microscopy and Image Analysis, UZH
 //
 // If you publish a paper using this macro, please acknowledge.
 //
-// Description: Builds multi-channel stacks from individual TIF tiles exported
+// Description: Assembles multi-channel stacks from individual TIF tiles exported
 //   by Molecular Devices ImageXpress (MD HCS).
 //   - Auto-detects flat folders or timepoint subfolder structure
 //   - Groups tiles by well prefix from filename tags (_w, _z, _s)
