@@ -41,7 +41,7 @@ prefix_s0_w0_z0.tif
 ## Usage
 
 1. Open [Fiji](https://fiji.sc)
-2. Drag and drop `zmb_MD_HCS_stack_assembler.ijm` onto the Fiji toolbar, or open via `Plugins > Macros > Run...`
+2. Drag and drop `ZMB_MD_HCS_stack_assembler.ijm` onto the Fiji toolbar, or open via `Plugins > Macros > Run...`
 3. Select the input folder containing TIF tiles (flat or with `timepoint` subfolders)
 4. Select an output folder
 5. Tick **Hyperstack** and/or **Maximum Intensity Projection**
