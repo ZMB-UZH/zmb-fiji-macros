@@ -141,6 +141,7 @@ if (numTP > 0) {
 print("Input:  " + inputDir);
 print("Output: " + outputDir);
 stackCount = 0;
+startTime = getTime();
 
 // --- Process ---
 setBatchMode(true);
@@ -344,4 +345,7 @@ for (tp = 0; tp < numTP; tp++) {
 }
 
 setBatchMode(false);
-print("Done — " + stackCount + " stack(s) processed.");
+elapsed = (getTime() - startTime) / 1000;
+min = floor(elapsed / 60);
+sec = floor(elapsed - min * 60);
+print("Done — " + stackCount + " stack(s) processed in " + min + "m " + sec + "s.");
