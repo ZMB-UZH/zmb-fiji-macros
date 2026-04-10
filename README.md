@@ -1,6 +1,6 @@
 # zmb-fiji-macros
 
-Fiji macros by the [ZMB Center for Microscopy and Image Analysis](https://www.zmb.uzh.ch), University of Zurich.
+Fiji macros by the [ZMB Center for Microscopy and Image Analysis](https://www.zmb.uzh.ch), University of Zurich. This repository provides ready-to-use macros for common microscopy image processing tasks across the instruments and systems supported by the ZMB.
 
 ## Contents
 
