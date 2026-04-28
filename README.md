@@ -7,7 +7,7 @@ Fiji macros by the [ZMB Center for Microscopy and Image Analysis](https://www.zm
 | Category | Instrument / system | Description |
 |----------|-------------------|-------------|
 | [Stack assemblers](stack-assemblers/) | [Molecular Devices HCS](stack-assemblers/molecular-devices-HCS/) | Assemble TIF tiles into hyperstacks and/or MIPs |
-| [Target curation](target-curation/) | [Molecular Devices HCS](target-curation/molecular-devices-HCS/) | Filter Encarta target lists down to N cells per site for downstream targeted acquisition |
+| [Target curation](target-curation/) | [Molecular Devices HCS](target-curation/molecular-devices-HCS/) | Filter IN Carta target lists down to N cells per site for downstream targeted acquisition |
 
 ## Getting started
 

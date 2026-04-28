@@ -1,12 +1,12 @@
 # MD HCS target curation
 
-When you run an Encarta analysis on a Molecular Devices ImageXpress (MD HCS) overview, it can detect dozens of cells per well — usually more than you actually want to re-image at high magnification. This macro thins each site's list down to **N cells per site** (default 5), picked at random, and skips any cell whose re-imaging tile would overlap one that has already been picked. The original Encarta output is preserved, so you can re-run the macro as often as you like.
+When you run an IN Carta analysis on a Molecular Devices ImageXpress (MD HCS) overview, it can detect dozens of cells per well — usually more than you actually want to re-image at high magnification. This macro thins each site's list down to **N cells per site** (default 5), picked at random, and skips any cell whose re-imaging tile would overlap one that has already been picked. The original IN Carta output is preserved, so you can re-run the macro as often as you like.
 
 ## What it does
 
 - Picks N cells per site at random (default 5).
 - Skips cells that would land too close to one already picked, so the high-magnification tiles don't overlap.
-- Saves the original Encarta output once, the first time you run it, and re-curates from that copy on every subsequent run.
+- Saves the original IN Carta output once, the first time you run it, and re-curates from that copy on every subsequent run.
 - Shows a summary at the end listing any sites that didn't reach N, with the reason.
 - Does not touch the `SummaryInfo`, `ObjectData`, `FieldData`, or `WellData` CSVs.
 
@@ -14,7 +14,7 @@ When you run an Encarta analysis on a Molecular Devices ImageXpress (MD HCS) ove
 
 For each site:
 
-1. Read all the cells Encarta detected.
+1. Read all the cells IN Carta detected.
 2. Look at them in a random order.
 3. Accept each cell that is far enough from every cell already picked.
 4. Stop once N cells are picked, or when no more cells fit.
@@ -47,16 +47,16 @@ After the run, each site is reported in the summary dialog as one of:
 | Status | Meaning |
 |---|---|
 | `full` | Got exactly N cells. |
-| `low_cells` | Encarta found fewer than N cells in the first place, so the macro just kept all of them. |
-| `constrained` | Encarta found enough cells, but the minimum-distance rule wouldn't let the macro fit N of them. Lower the minimum distance, or accept the smaller picture. |
+| `low_cells` | IN Carta found fewer than N cells in the first place, so the macro just kept all of them. |
+| `constrained` | IN Carta found enough cells, but the minimum-distance rule wouldn't let the macro fit N of them. Lower the minimum distance, or accept the smaller picture. |
 
 ## Where the files go
 
-Input — the analysis results folder Encarta produced, e.g. `experiment/Results/Brightest Nuclei_<timestamp>/` or `.../Largest Cells_<timestamp>/`:
+Input — the analysis results folder IN Carta produced, e.g. `experiment/Results/Brightest Nuclei_<timestamp>/` or `.../Largest Cells_<timestamp>/`:
 
 ```
 <resultsDir>/
-  TargetData/                                     (Encarta's output; renamed on first run)
+  TargetData/                                     (IN Carta's output; renamed on first run)
     Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv
 ```
 
@@ -66,7 +66,7 @@ Output:
 <resultsDir>/
   TargetData/                                     (curated list; MetaXpress reads from here)
     Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv     (filtered to N rows)
-  TargetData_original/                            (Encarta's original output, untouched)
+  TargetData_original/                            (IN Carta's original output, untouched)
     Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv
 ```
 
@@ -83,4 +83,4 @@ The picks are produced from a fixed random seed (42) in the script, so re-runnin
 
 ## Before trusting it in production
 
-The macro replaces the contents of `TargetData/` with the curated list, but the workflow only works if MetaXpress actually re-reads `TargetData/` at the moment the targeted acquisition is queued — not earlier, when Encarta finished writing. To check: open one of the curated CSVs, hand-edit it to obviously fewer rows, queue the targeted acquisition, and confirm MetaXpress images only the smaller set. If it does, the workflow is reliable.
+The macro replaces the contents of `TargetData/` with the curated list, but the workflow only works if MetaXpress actually re-reads `TargetData/` at the moment the targeted acquisition is queued — not earlier, when IN Carta finished writing. To check: open one of the curated CSVs, hand-edit it to obviously fewer rows, queue the targeted acquisition, and confirm MetaXpress images only the smaller set. If it does, the workflow is reliable.

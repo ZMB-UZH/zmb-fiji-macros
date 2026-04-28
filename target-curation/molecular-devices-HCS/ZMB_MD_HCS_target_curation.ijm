@@ -9,7 +9,7 @@
 //
 // If you publish a paper using this macro, please acknowledge.
 //
-// Description: Curate MetaXpress TargetData CSVs produced by Encarta segmentation
+// Description: Curate MetaXpress TargetData CSVs produced by IN Carta segmentation
 //   so a downstream targeted acquisition images N cells per site instead of all
 //   detected cells. Picks are random per site with a Euclidean minimum-distance
 //   constraint between bounding-box centres so re-imaging tiles stay separated.
@@ -19,20 +19,20 @@
 // Behaviour:
 //   - First run renames TargetData/ -> TargetData_original/ (idempotent).
 //   - Every run reads from TargetData_original/ and rewrites TargetData/ from
-//     scratch. The original Encarta output is never modified.
+//     scratch. The original IN Carta output is never modified.
 //   - SummaryInfo, ObjectData, FieldData, WellData are left untouched.
 //   - At the end, a summary dialog reports settings used and any sites that
 //     ended up under target (with reason: low_cells or constrained).
 //
 // Expected input:
 //   <resultsDir>/
-//     TargetData/                                 (Encarta output; renamed on first run)
+//     TargetData/                                 (IN Carta output; renamed on first run)
 //       Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv
 //
 // Output:
 //   <resultsDir>/
 //     TargetData/                                 (curated; MetaXpress reads from here)
-//     TargetData_original/                        (preserved Encarta output)
+//     TargetData_original/                        (preserved IN Carta output)
 //
 // Picking algorithm:
 //   - Random shuffle of detected cells (Fisher-Yates), walk through, accept
@@ -94,7 +94,7 @@ if (!endsWith(resultsDir, File.separator)) resultsDir += File.separator;
 origDir = resultsDir + "TargetData_original" + File.separator;
 curDir  = resultsDir + "TargetData" + File.separator;
 
-// First run: rename Encarta's TargetData/ -> TargetData_original/.
+// First run: rename IN Carta's TargetData/ -> TargetData_original/.
 if (!File.isDirectory(origDir)) {
     if (!File.isDirectory(curDir))
         exit("No TargetData/ folder at: " + curDir);
