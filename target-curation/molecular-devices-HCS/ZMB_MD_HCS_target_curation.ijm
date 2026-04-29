@@ -3,8 +3,8 @@
 // @Double(label = "Minimum distance between objects in the overview image (pixels, 0 = no constraint)", value = 340, min = 0) minDistPx
 
 // ------------------------------------------------------------------------------
-// Fiji: MD HCS target curation (v1.4.0)
-// Created: 2026-04-28 | Updated: 2026-04-28
+// Fiji: MD HCS target curation (v1.5.0)
+// Created: 2026-04-28 | Updated: 2026-04-29
 // Author: thom.dehoog@zmb.uzh.ch | ZMB Center for Microscopy and Image Analysis, UZH
 //
 // If you publish a paper using this macro, please acknowledge.
@@ -20,6 +20,8 @@
 //   - First run renames TargetData/ -> TargetData_original/ (idempotent).
 //   - Every run reads from TargetData_original/ and rewrites TargetData/ from
 //     scratch. The original IN Carta output is never modified.
+//   - Every run also writes TargetData_curated/, a mirror of TargetData/ plus
+//     curation_changes.csv for auditing what changed.
 //   - SummaryInfo, ObjectData, FieldData, WellData are left untouched.
 //   - At the end, a summary dialog reports settings used and any sites that
 //     ended up under target (with reason: low_cells or constrained).
@@ -32,6 +34,7 @@
 // Output:
 //   <resultsDir>/
 //     TargetData/                                 (curated; MetaXpress reads from here)
+//     TargetData_curated/                         (curated mirror plus changes log)
 //     TargetData_original/                        (preserved IN Carta output)
 //
 // Picking algorithm:
@@ -78,6 +81,38 @@ function stripCR(s) {
     return s;
 }
 
+// Split one CSV row, preserving commas inside quoted fields.
+function splitCsvRow(row) {
+    fields = newArray(0);
+    field = "";
+    quote = fromCharCode(34);
+    inQuotes = false;
+
+    for (ii = 0; ii < lengthOf(row); ii++) {
+        ch = substring(row, ii, ii+1);
+        if (ch == quote) {
+            if (inQuotes && ii+1 < lengthOf(row)) {
+                if (substring(row, ii+1, ii+2) == quote) {
+                    field = field + quote;
+                    ii++;
+                } else {
+                    inQuotes = !inQuotes;
+                }
+            } else {
+                inQuotes = !inQuotes;
+            }
+        } else if (ch == "," && !inQuotes) {
+            fields = Array.concat(fields, field);
+            field = "";
+        } else {
+            field = field + ch;
+        }
+    }
+
+    fields = Array.concat(fields, field);
+    return fields;
+}
+
 // Classify a site outcome based on detected and picked counts.
 // Returns "full", "low_cells", or "constrained".
 function siteStatus(nDetected, nPicked, target) {
@@ -93,6 +128,7 @@ if (!endsWith(resultsDir, File.separator)) resultsDir += File.separator;
 
 origDir = resultsDir + "TargetData_original" + File.separator;
 curDir  = resultsDir + "TargetData" + File.separator;
+auditDir = resultsDir + "TargetData_curated" + File.separator;
 
 // First run: rename IN Carta's TargetData/ -> TargetData_original/.
 if (!File.isDirectory(origDir)) {
@@ -103,12 +139,24 @@ if (!File.isDirectory(origDir)) {
     print("First run: renamed TargetData/ -> TargetData_original/");
 }
 
-// Refresh curated output folder (always overwritten from TargetData_original/).
+// Refresh curated output folders (always overwritten from TargetData_original/).
 if (File.isDirectory(curDir)) {
     stale = getFileList(curDir);
-    for (i = 0; i < stale.length; i++) File.delete(curDir + stale[i]);
+    for (i = 0; i < stale.length; i++) {
+        if (!File.delete(curDir + stale[i]))
+            exit("Could not delete stale file from TargetData/: " + curDir + stale[i]);
+    }
 } else {
     File.makeDirectory(curDir);
+}
+if (File.isDirectory(auditDir)) {
+    stale = getFileList(auditDir);
+    for (i = 0; i < stale.length; i++) {
+        if (!File.delete(auditDir + stale[i]))
+            exit("Could not delete stale file from TargetData_curated/: " + auditDir + stale[i]);
+    }
+} else {
+    File.makeDirectory(auditDir);
 }
 
 // Fixed seed for reproducible curation. Edit to draw a different sample.
@@ -117,10 +165,13 @@ random("seed", seed);
 
 // --- Curate each site ---
 list = getFileList(origDir);
+Array.sort(list);
 totalIn = 0;
 totalOut = 0;
 nFiles = 0;
 underList = newArray(0);  // human-readable lines for sites that ended up under-target
+skippedList = newArray(0); // human-readable lines for files that could not be curated
+changeRows = newArray(0);  // tab-separated rows for TargetData_curated/curation_changes.csv
 
 for (f = 0; f < list.length; f++) {
     name = list[f];
@@ -129,10 +180,15 @@ for (f = 0; f < list.length; f++) {
 
     raw = File.openAsString(origDir + name);
     lines = split(raw, "\n");
-    if (lines.length < 2) continue;
+    if (lines.length < 1 || lengthOf(stripCR(lines[0])) == 0) {
+        print("skip (empty or missing header): " + name);
+        skippedList = Array.concat(skippedList, name + ": empty or missing header");
+        changeRows = Array.concat(changeRows, name + "\tNA\t0\tskipped_empty_or_missing_header\t");
+        continue;
+    }
 
     header = stripCR(lines[0]);
-    cols = split(header, ",");
+    cols = splitCsvRow(header);
     iBX  = findColumn(cols, "T1$AS_FID_Blob_BoundingBoxX");
     iBY  = findColumn(cols, "T1$AS_FID_Blob_BoundingBoxY");
     iBW  = findColumn(cols, "T1$AS_FID_Blob_BoundingBoxWidth");
@@ -140,10 +196,14 @@ for (f = 0; f < list.length; f++) {
     iOID = findColumn(cols, "object_id");
     if (iBX < 0 || iBY < 0 || iBW < 0 || iBH < 0) {
         print("skip (missing bounding-box columns): " + name);
+        skippedList = Array.concat(skippedList, name + ": missing bounding-box columns");
+        changeRows = Array.concat(changeRows, name + "\tNA\t0\tskipped_missing_bounding_box_columns\t");
         continue;
     }
     if (iOID < 0) {
         print("skip (missing object_id column): " + name);
+        skippedList = Array.concat(skippedList, name + ": missing object_id column");
+        changeRows = Array.concat(changeRows, name + "\tNA\t0\tskipped_missing_object_id_column\t");
         continue;
     }
 
@@ -154,7 +214,7 @@ for (f = 0; f < list.length; f++) {
     for (i = 1; i < lines.length; i++) {
         row = stripCR(lines[i]);
         if (lengthOf(row) == 0) continue;
-        flds = split(row, ",");
+        flds = splitCsvRow(row);
         if (flds.length < cols.length) continue;
         x = parseFloat(flds[iBX]);
         y = parseFloat(flds[iBY]);
@@ -209,35 +269,66 @@ for (f = 0; f < list.length; f++) {
         pickedIdsStr = pickedIdsStr + oid[picked[k]];
     }
     File.saveString(out, curDir + name);
+    File.saveString(out, auditDir + name);
 
     siteLabel = substring(name, 0, lengthOf(name) - 4);
     if (status != "full")
         underList = Array.concat(underList,
             siteLabel + ":  " + n + " detected, " + picked.length + " picked  (" + status + ")");
+    changeRows = Array.concat(changeRows,
+        name + "\t" + n + "\t" + picked.length + "\t" + status + "\t" + pickedIdsStr);
 
     print(name + ":  " + n + " -> " + picked.length + "  [" + status + "]");
     totalOut += picked.length;
 }
 
+getDateAndTime(year, month, dayOfWeek, dayOfMonth, hour, minute, second, msec);
+runDate = d2s(year, 0) + "-" + d2s(month + 1, 0) + "-" + d2s(dayOfMonth, 0) + " " +
+    d2s(hour, 0) + ":" + d2s(minute, 0) + ":" + d2s(second, 0);
+changes = "ZMB MD HCS target curation changes\r\n";
+changes += "Run\t" + runDate + "\r\n";
+changes += "Targets per site\t" + targetsPerSite + "\r\n";
+changes += "Minimum distance overview px\t" + minDistPx + "\r\n";
+changes += "Seed\t" + seed + "\r\n";
+changes += "Originals\t" + origDir + "\r\n";
+changes += "Operational TargetData\t" + curDir + "\r\n";
+changes += "Curated mirror\t" + auditDir + "\r\n";
+changes += "\r\n";
+changes += "file\tdetected_valid_rows\tpicked_rows\tstatus\tpicked_object_ids\r\n";
+for (i = 0; i < changeRows.length; i++) changes += changeRows[i] + "\r\n";
+File.saveString(changes, auditDir + "curation_changes.csv");
+
 // --- Summary in Log window ---
 print("");
 print("Sites processed: " + nFiles);
+print("Files skipped:   " + skippedList.length);
 print("Targets:         " + totalIn + " -> " + totalOut);
 print("Settings:        N=" + targetsPerSite + ", min-dist=" + minDistPx + " overview px");
 print("Curated:         " + curDir);
+print("Curated mirror:  " + auditDir);
 print("Originals:       " + origDir);
 
 // --- Summary dialog ---
 report  = "Sites processed: " + nFiles + "\n";
+report += "Files skipped:   " + skippedList.length + "\n";
 report += "Targets:         " + totalIn + " -> " + totalOut + " (N=" + targetsPerSite + " per site)\n";
 report += "Min distance:    " + minDistPx + " overview px\n";
 report += "\n";
-if (underList.length == 0) {
+if (underList.length == 0 && skippedList.length == 0) {
     report += "All sites at full N=" + targetsPerSite + ".\n";
 } else {
-    report += "Sites under target (" + underList.length + "):\n";
-    for (i = 0; i < underList.length; i++) report += "  " + underList[i] + "\n";
+    if (underList.length > 0) {
+        report += "Sites under target (" + underList.length + "):\n";
+        for (i = 0; i < underList.length; i++) report += "  " + underList[i] + "\n";
+        report += "\n";
+    }
+    if (skippedList.length > 0) {
+        report += "Skipped files (" + skippedList.length + "):\n";
+        for (i = 0; i < skippedList.length; i++) report += "  " + skippedList[i] + "\n";
+    }
 }
-report += "\nCurated:    " + curDir + "\n";
-report += "Originals:  " + origDir;
+report += "\nCurated:         " + curDir + "\n";
+report += "Curated mirror:  " + auditDir + "\n";
+report += "Changes:         " + auditDir + "curation_changes.csv\n";
+report += "Originals:       " + origDir;
 showMessage("Target curation summary", report);

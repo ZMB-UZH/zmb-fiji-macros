@@ -7,6 +7,7 @@ When you run an IN Carta analysis on a Molecular Devices ImageXpress (MD HCS) ov
 - Picks N cells per site at random (default 5).
 - Skips cells that would land too close to one already picked, so the high-magnification tiles don't overlap.
 - Saves the original IN Carta output once, the first time you run it, and re-curates from that copy on every subsequent run.
+- Writes a `TargetData_curated/` mirror of the curated `TargetData/` folder, including a `curation_changes.csv` audit file.
 - Shows a summary at the end listing any sites that didn't reach N, with the reason.
 - Does not touch the `SummaryInfo`, `ObjectData`, `FieldData`, or `WellData` CSVs.
 
@@ -66,6 +67,9 @@ Output:
 <resultsDir>/
   TargetData/                                     (curated list; MetaXpress reads from here)
     Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv     (filtered to N rows)
+  TargetData_curated/                             (curated mirror for inspection/auditing)
+    Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv     (same curated CSVs as TargetData/)
+    curation_changes.csv                          (tab-delimited settings plus per-file picked/skipped summary)
   TargetData_original/                            (IN Carta's original output, untouched)
     Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv
 ```
