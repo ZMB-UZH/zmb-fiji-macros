@@ -3,7 +3,7 @@
 // @Double(label = "Minimum distance between objects in the overview image (pixels, 0 = no constraint)", value = 340, min = 0) minDistPx
 
 // ------------------------------------------------------------------------------
-// Fiji: MD HCS target curation (v1.7.0)
+// Fiji: MD HCS target curation (v1.8.0)
 // Created: 2026-04-28 | Updated: 2026-04-29
 // Author: thom.dehoog@zmb.uzh.ch | ZMB Center for Microscopy and Image Analysis, UZH
 //
@@ -62,6 +62,13 @@
 //   - Pick order is random but the seed is fixed in source so runs are
 //     reproducible: same input + same settings always produces the same
 //     picks. Edit the `seed` constant near the top of the script to vary.
+//     The seed is global across files in a run, so picks for later files
+//     depend on earlier ones; if any earlier CSV changes, picks downstream
+//     of it will shift even if those CSVs were untouched.
+//   - The picks are NOT a uniform random sample of valid N-cell subsets:
+//     the shuffle-then-greedy procedure with a min-distance filter biases
+//     against cells that cluster near already-picked ones. Fine for picking
+//     sites to image, not appropriate as input for spatial-statistics.
 //   - The macro requires the object_id and BoundingBox columns in each
 //     TargetData CSV; sites without them are skipped with a warning.
 // ------------------------------------------------------------------------------
@@ -73,6 +80,7 @@ function findColumn(headerCols, name) {
     for (i = 0; i < headerCols.length; i++) {
         c = headerCols[i];
         if (endsWith(c, "\r")) c = substring(c, 0, lengthOf(c)-1);
+        c = replace(c, "^[ \t]+|[ \t]+$", "");
         if (c == name) return i;
     }
     return -1;
@@ -82,6 +90,26 @@ function findColumn(headerCols, name) {
 function stripCR(s) {
     if (endsWith(s, "\r")) return substring(s, 0, lengthOf(s)-1);
     return s;
+}
+
+// Strip a UTF-8 / UTF-16 BOM if present at the start of a string. Some
+// exporters add a BOM to the first byte of the file, which would otherwise
+// glue itself to the first column header and break exact-match column lookup.
+function stripBom(s) {
+    if (lengthOf(s) >= 1 && substring(s, 0, 1) == fromCharCode(65279))
+        return substring(s, 1, lengthOf(s));
+    if (lengthOf(s) >= 3 &&
+        substring(s, 0, 1) == fromCharCode(239) &&
+        substring(s, 1, 2) == fromCharCode(187) &&
+        substring(s, 2, 3) == fromCharCode(191))
+        return substring(s, 3, lengthOf(s));
+    return s;
+}
+
+// Two-digit zero-padded decimal for date formatting.
+function pad2(n) {
+    if (n < 10) return "0" + d2s(n, 0);
+    return d2s(n, 0);
 }
 
 // Split one CSV row, preserving commas inside quoted fields.
@@ -140,6 +168,8 @@ function assertCurrentTargetDataIsPreviousCuration(curDir, auditDir) {
             exit("Unexpected subfolder in TargetData/: " + curDir + name);
         if (!File.exists(auditDir + name))
             exit("Current TargetData/ does not match the previous TargetData_curated/ mirror. Refusing to overwrite possible new IN Carta output: " + curDir + name);
+        if (File.length(curDir + name) != File.length(auditDir + name))
+            exit("Current TargetData/ differs from the previous TargetData_curated/ mirror. Refusing to overwrite possible new IN Carta output: " + curDir + name);
         if (File.openAsString(curDir + name) != File.openAsString(auditDir + name))
             exit("Current TargetData/ differs from the previous TargetData_curated/ mirror. Refusing to overwrite possible new IN Carta output: " + curDir + name);
     }
@@ -226,7 +256,7 @@ for (f = 0; f < list.length; f++) {
         continue;
     }
 
-    header = stripCR(lines[0]);
+    header = stripBom(stripCR(lines[0]));
     cols = splitCsvRow(header);
     iBX  = findColumn(cols, "T1$AS_FID_Blob_BoundingBoxX");
     iBY  = findColumn(cols, "T1$AS_FID_Blob_BoundingBoxY");
@@ -333,8 +363,8 @@ for (f = 0; f < list.length; f++) {
 }
 
 getDateAndTime(year, month, dayOfWeek, dayOfMonth, hour, minute, second, msec);
-runDate = d2s(year, 0) + "-" + d2s(month + 1, 0) + "-" + d2s(dayOfMonth, 0) + " " +
-    d2s(hour, 0) + ":" + d2s(minute, 0) + ":" + d2s(second, 0);
+runDate = d2s(year, 0) + "-" + pad2(month + 1) + "-" + pad2(dayOfMonth) + " " +
+    pad2(hour) + ":" + pad2(minute) + ":" + pad2(second);
 changes = "ZMB MD HCS target curation changes\r\n";
 changes += "Run\t" + runDate + "\r\n";
 changes += "Targets per site\t" + targetsPerSite + "\r\n";

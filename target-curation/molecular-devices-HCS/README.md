@@ -24,6 +24,8 @@ For each site:
 
 If you set the minimum distance to `0`, the spacing check is turned off and the macro simply picks the first N cells in random order.
 
+This procedure is designed to spread the picks out across a site, not to produce a statistically unbiased sample. Cells in dense clusters get one or two picks at most (everything else fails the spacing check), so the curated set should not be used as input for downstream spatial-statistics about the underlying cell distribution.
+
 ## Choosing the minimum distance
 
 The minimum distance is given in **pixels of the overview image**, the same units the bounding-box columns in the CSVs already use. Two cells closer than this distance are treated as overlapping — only the first one to be picked is kept.
@@ -85,9 +87,22 @@ Output:
 5. Set the minimum distance between cells, in overview pixels (default 340, or `0` to turn the spacing check off).
 6. Run. A summary dialog at the end tells you how many cells were picked per site, and flags any that didn't reach N.
 
-The picks are produced from a fixed random seed (42) in the script, so re-running with the same settings gives you the same picks. To draw a different random sample, edit the `seed` constant near the top of the macro.
+The picks are produced from a fixed random seed (42) in the script, so re-running with the same settings gives you the same picks. To draw a different random sample, edit the `seed` constant near the top of the macro. The seed is global across all files in a run, so picks for a given site depend on the files processed before it: if IN Carta re-segments any earlier file and changes its row count, picks for sites later in the alphabetical order will shift too, even if their input was unchanged.
 
 On rerun, the macro only overwrites `TargetData/` if it can verify that `TargetData/` still matches the previous `TargetData_curated/` mirror. If IN Carta has regenerated a new `TargetData/` in the same results folder, the macro aborts instead of deleting it.
+
+### Running headless
+
+To run without the Fiji GUI (for cron jobs, scripted pipelines, or automation chained from MetaXpress):
+
+```
+"C:\Users\you\Fiji.app\ImageJ-win64.exe" --headless --console --run "ZMB_MD_HCS_target_curation.ijm" "resultsDir='Z:/path/to/experiment/Results/Brightest Nuclei_<timestamp>',targetsPerSite=5,minDistPx=340"
+```
+
+Notes:
+
+- Use forward slashes inside `resultsDir='...'`; Fiji handles them more reliably in script-parameter strings.
+- The end-of-run summary dialog is suppressed in headless mode. Read the per-file log lines printed to the console by `--console`, and `TargetData_curated/curation_changes.csv` for the full settings + per-file outcome record.
 
 ## Before trusting it in production
 
