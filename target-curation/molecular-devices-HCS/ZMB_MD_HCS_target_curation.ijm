@@ -3,7 +3,7 @@
 // @Double(label = "Minimum distance between objects in the overview image (pixels, 0 = no constraint)", value = 340, min = 0) minDistPx
 
 // ------------------------------------------------------------------------------
-// Fiji: MD HCS target curation (v1.6.0)
+// Fiji: MD HCS target curation (v1.7.0)
 // Created: 2026-04-28 | Updated: 2026-04-29
 // Author: thom.dehoog@zmb.uzh.ch | ZMB Center for Microscopy and Image Analysis, UZH
 //
@@ -32,7 +32,7 @@
 // Expected input:
 //   <resultsDir>/
 //     TargetData/                                 (IN Carta output; renamed on first run)
-//       Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv
+//       *.csv                                     (all CSVs in this folder are considered)
 //
 // Output:
 //   <resultsDir>/
@@ -215,7 +215,6 @@ changeRows = newArray(0);  // tab-separated rows for TargetData_curated/curation
 
 for (f = 0; f < list.length; f++) {
     name = list[f];
-    if (!startsWith(name, "Cells_singleTargetData_")) continue;
     if (!endsWith(name, ".csv")) continue;
 
     raw = File.openAsString(origDir + name);

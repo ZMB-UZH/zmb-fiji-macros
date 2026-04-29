@@ -60,7 +60,7 @@ Input — the analysis results folder IN Carta produced, e.g. `experiment/Result
 ```
 <resultsDir>/
   TargetData/                                     (IN Carta's output; renamed on first run)
-    Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv
+    *.csv                                         (all CSVs in this folder are considered)
 ```
 
 Output:
@@ -68,12 +68,12 @@ Output:
 ```
 <resultsDir>/
   TargetData/                                     (curated list; MetaXpress reads from here)
-    Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv     (filtered to N rows)
+    *.csv                                         (curatable CSVs filtered to N rows)
   TargetData_curated/                             (curated mirror for inspection/auditing)
-    Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv     (same curated CSVs as TargetData/)
+    *.csv                                         (same curated CSVs as TargetData/)
     curation_changes.csv                          (tab-delimited settings plus per-file picked/skipped/rejected summary)
   TargetData_original/                            (IN Carta's original output, untouched)
-    Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv
+    *.csv
 ```
 
 ## How to run it
