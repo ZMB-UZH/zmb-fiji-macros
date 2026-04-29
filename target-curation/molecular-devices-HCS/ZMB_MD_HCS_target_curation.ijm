@@ -3,7 +3,7 @@
 // @Double(label = "Minimum distance between objects in the overview image (pixels, 0 = no constraint)", value = 340, min = 0) minDistPx
 
 // ------------------------------------------------------------------------------
-// Fiji: MD HCS target curation (v1.5.0)
+// Fiji: MD HCS target curation (v1.6.0)
 // Created: 2026-04-28 | Updated: 2026-04-29
 // Author: thom.dehoog@zmb.uzh.ch | ZMB Center for Microscopy and Image Analysis, UZH
 //
@@ -22,6 +22,9 @@
 //     scratch. The original IN Carta output is never modified.
 //   - Every run also writes TargetData_curated/, a mirror of TargetData/ plus
 //     curation_changes.csv for auditing what changed.
+//   - If TargetData_original/ already exists, TargetData/ must match the
+//     previous TargetData_curated/ mirror before it is overwritten. This avoids
+//     accidentally deleting newly regenerated IN Carta TargetData.
 //   - SummaryInfo, ObjectData, FieldData, WellData are left untouched.
 //   - At the end, a summary dialog reports settings used and any sites that
 //     ended up under target (with reason: low_cells or constrained).
@@ -121,6 +124,35 @@ function siteStatus(nDetected, nPicked, target) {
     return "constrained";
 }
 
+// Refuse to delete TargetData/ on rerun unless it is the previous curated output.
+function assertCurrentTargetDataIsPreviousCuration(curDir, auditDir) {
+    if (!File.isDirectory(curDir)) return;
+    if (!File.isDirectory(auditDir))
+        exit("TargetData_original/ already exists, but TargetData_curated/ is missing. Refusing to overwrite TargetData/ because it may contain newly regenerated IN Carta output.");
+    if (!File.exists(auditDir + "curation_changes.csv"))
+        exit("TargetData_original/ already exists, but TargetData_curated/curation_changes.csv is missing. Refusing to overwrite TargetData/ because its provenance cannot be verified.");
+
+    curList = getFileList(curDir);
+    auditList = getFileList(auditDir);
+    for (ii = 0; ii < curList.length; ii++) {
+        name = curList[ii];
+        if (File.isDirectory(curDir + name))
+            exit("Unexpected subfolder in TargetData/: " + curDir + name);
+        if (!File.exists(auditDir + name))
+            exit("Current TargetData/ does not match the previous TargetData_curated/ mirror. Refusing to overwrite possible new IN Carta output: " + curDir + name);
+        if (File.openAsString(curDir + name) != File.openAsString(auditDir + name))
+            exit("Current TargetData/ differs from the previous TargetData_curated/ mirror. Refusing to overwrite possible new IN Carta output: " + curDir + name);
+    }
+    for (ii = 0; ii < auditList.length; ii++) {
+        name = auditList[ii];
+        if (name == "curation_changes.csv") continue;
+        if (File.isDirectory(auditDir + name))
+            exit("Unexpected subfolder in TargetData_curated/: " + auditDir + name);
+        if (!File.exists(curDir + name))
+            exit("Current TargetData/ is missing a file from the previous TargetData_curated/ mirror. Refusing to overwrite because the current state is inconsistent: " + name);
+    }
+}
+
 // --- Resolve paths and set up output folders ---
 if (!File.isDirectory(resultsDir))
     exit("Not a directory: " + resultsDir);
@@ -137,6 +169,8 @@ if (!File.isDirectory(origDir)) {
     if (!File.rename(curDir, origDir))
         exit("Could not rename TargetData/ -> TargetData_original/.");
     print("First run: renamed TargetData/ -> TargetData_original/");
+} else {
+    assertCurrentTargetDataIsPreviousCuration(curDir, auditDir);
 }
 
 // Refresh curated output folders (always overwritten from TargetData_original/).
@@ -148,6 +182,8 @@ if (File.isDirectory(curDir)) {
     }
 } else {
     File.makeDirectory(curDir);
+    if (!File.isDirectory(curDir))
+        exit("Could not create TargetData/ folder: " + curDir);
 }
 if (File.isDirectory(auditDir)) {
     stale = getFileList(auditDir);
@@ -157,6 +193,8 @@ if (File.isDirectory(auditDir)) {
     }
 } else {
     File.makeDirectory(auditDir);
+    if (!File.isDirectory(auditDir))
+        exit("Could not create TargetData_curated/ folder: " + auditDir);
 }
 
 // Fixed seed for reproducible curation. Edit to draw a different sample.
@@ -169,8 +207,10 @@ Array.sort(list);
 totalIn = 0;
 totalOut = 0;
 nFiles = 0;
+totalRejectedRows = 0;
 underList = newArray(0);  // human-readable lines for sites that ended up under-target
 skippedList = newArray(0); // human-readable lines for files that could not be curated
+rejectedList = newArray(0); // human-readable lines for files with rejected malformed rows
 changeRows = newArray(0);  // tab-separated rows for TargetData_curated/curation_changes.csv
 
 for (f = 0; f < list.length; f++) {
@@ -183,7 +223,7 @@ for (f = 0; f < list.length; f++) {
     if (lines.length < 1 || lengthOf(stripCR(lines[0])) == 0) {
         print("skip (empty or missing header): " + name);
         skippedList = Array.concat(skippedList, name + ": empty or missing header");
-        changeRows = Array.concat(changeRows, name + "\tNA\t0\tskipped_empty_or_missing_header\t");
+        changeRows = Array.concat(changeRows, name + "\tNA\tNA\t0\tskipped_empty_or_missing_header\t");
         continue;
     }
 
@@ -197,13 +237,13 @@ for (f = 0; f < list.length; f++) {
     if (iBX < 0 || iBY < 0 || iBW < 0 || iBH < 0) {
         print("skip (missing bounding-box columns): " + name);
         skippedList = Array.concat(skippedList, name + ": missing bounding-box columns");
-        changeRows = Array.concat(changeRows, name + "\tNA\t0\tskipped_missing_bounding_box_columns\t");
+        changeRows = Array.concat(changeRows, name + "\tNA\tNA\t0\tskipped_missing_bounding_box_columns\t");
         continue;
     }
     if (iOID < 0) {
         print("skip (missing object_id column): " + name);
         skippedList = Array.concat(skippedList, name + ": missing object_id column");
-        changeRows = Array.concat(changeRows, name + "\tNA\t0\tskipped_missing_object_id_column\t");
+        changeRows = Array.concat(changeRows, name + "\tNA\tNA\t0\tskipped_missing_object_id_column\t");
         continue;
     }
 
@@ -211,16 +251,23 @@ for (f = 0; f < list.length; f++) {
     cx   = newArray(0);
     cy   = newArray(0);
     oid  = newArray(0);
+    rejectedRows = 0;
     for (i = 1; i < lines.length; i++) {
         row = stripCR(lines[i]);
         if (lengthOf(row) == 0) continue;
         flds = splitCsvRow(row);
-        if (flds.length < cols.length) continue;
+        if (flds.length < cols.length) {
+            rejectedRows++;
+            continue;
+        }
         x = parseFloat(flds[iBX]);
         y = parseFloat(flds[iBY]);
         w = parseFloat(flds[iBW]);
         h = parseFloat(flds[iBH]);
-        if (isNaN(x) || isNaN(y) || isNaN(w) || isNaN(h)) continue;
+        if (isNaN(x) || isNaN(y) || isNaN(w) || isNaN(h)) {
+            rejectedRows++;
+            continue;
+        }
         rows = Array.concat(rows, row);
         cx   = Array.concat(cx, x + w/2.0);
         cy   = Array.concat(cy, y + h/2.0);
@@ -229,6 +276,7 @@ for (f = 0; f < list.length; f++) {
 
     n = rows.length;
     totalIn += n;
+    totalRejectedRows += rejectedRows;
     nFiles++;
 
     // Fisher-Yates shuffle of [0..n-1].
@@ -275,10 +323,13 @@ for (f = 0; f < list.length; f++) {
     if (status != "full")
         underList = Array.concat(underList,
             siteLabel + ":  " + n + " detected, " + picked.length + " picked  (" + status + ")");
+    if (rejectedRows > 0)
+        rejectedList = Array.concat(rejectedList,
+            siteLabel + ":  " + rejectedRows + " rejected malformed rows");
     changeRows = Array.concat(changeRows,
-        name + "\t" + n + "\t" + picked.length + "\t" + status + "\t" + pickedIdsStr);
+        name + "\t" + n + "\t" + rejectedRows + "\t" + picked.length + "\t" + status + "\t" + pickedIdsStr);
 
-    print(name + ":  " + n + " -> " + picked.length + "  [" + status + "]");
+    print(name + ":  " + n + " -> " + picked.length + "  [" + status + "], rejected rows=" + rejectedRows);
     totalOut += picked.length;
 }
 
@@ -294,7 +345,7 @@ changes += "Originals\t" + origDir + "\r\n";
 changes += "Operational TargetData\t" + curDir + "\r\n";
 changes += "Curated mirror\t" + auditDir + "\r\n";
 changes += "\r\n";
-changes += "file\tdetected_valid_rows\tpicked_rows\tstatus\tpicked_object_ids\r\n";
+changes += "file\tdetected_valid_rows\trejected_rows\tpicked_rows\tstatus\tpicked_object_ids\r\n";
 for (i = 0; i < changeRows.length; i++) changes += changeRows[i] + "\r\n";
 File.saveString(changes, auditDir + "curation_changes.csv");
 
@@ -302,6 +353,7 @@ File.saveString(changes, auditDir + "curation_changes.csv");
 print("");
 print("Sites processed: " + nFiles);
 print("Files skipped:   " + skippedList.length);
+print("Rows rejected:   " + totalRejectedRows);
 print("Targets:         " + totalIn + " -> " + totalOut);
 print("Settings:        N=" + targetsPerSite + ", min-dist=" + minDistPx + " overview px");
 print("Curated:         " + curDir);
@@ -311,10 +363,11 @@ print("Originals:       " + origDir);
 // --- Summary dialog ---
 report  = "Sites processed: " + nFiles + "\n";
 report += "Files skipped:   " + skippedList.length + "\n";
+report += "Rows rejected:   " + totalRejectedRows + "\n";
 report += "Targets:         " + totalIn + " -> " + totalOut + " (N=" + targetsPerSite + " per site)\n";
 report += "Min distance:    " + minDistPx + " overview px\n";
 report += "\n";
-if (underList.length == 0 && skippedList.length == 0) {
+if (underList.length == 0 && skippedList.length == 0 && rejectedList.length == 0) {
     report += "All sites at full N=" + targetsPerSite + ".\n";
 } else {
     if (underList.length > 0) {
@@ -325,6 +378,11 @@ if (underList.length == 0 && skippedList.length == 0) {
     if (skippedList.length > 0) {
         report += "Skipped files (" + skippedList.length + "):\n";
         for (i = 0; i < skippedList.length; i++) report += "  " + skippedList[i] + "\n";
+        report += "\n";
+    }
+    if (rejectedList.length > 0) {
+        report += "Files with rejected rows (" + rejectedList.length + "):\n";
+        for (i = 0; i < rejectedList.length; i++) report += "  " + rejectedList[i] + "\n";
     }
 }
 report += "\nCurated:         " + curDir + "\n";

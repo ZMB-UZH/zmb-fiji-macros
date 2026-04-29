@@ -8,7 +8,9 @@ When you run an IN Carta analysis on a Molecular Devices ImageXpress (MD HCS) ov
 - Skips cells that would land too close to one already picked, so the high-magnification tiles don't overlap.
 - Saves the original IN Carta output once, the first time you run it, and re-curates from that copy on every subsequent run.
 - Writes a `TargetData_curated/` mirror of the curated `TargetData/` folder, including a `curation_changes.csv` audit file.
+- Refuses to overwrite `TargetData/` on rerun unless it matches the previous `TargetData_curated/` mirror.
 - Shows a summary at the end listing any sites that didn't reach N, with the reason.
+- Reports malformed/rejected rows in the final summary and audit file.
 - Does not touch the `SummaryInfo`, `ObjectData`, `FieldData`, or `WellData` CSVs.
 
 ## How the picking works
@@ -69,7 +71,7 @@ Output:
     Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv     (filtered to N rows)
   TargetData_curated/                             (curated mirror for inspection/auditing)
     Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv     (same curated CSVs as TargetData/)
-    curation_changes.csv                          (tab-delimited settings plus per-file picked/skipped summary)
+    curation_changes.csv                          (tab-delimited settings plus per-file picked/skipped/rejected summary)
   TargetData_original/                            (IN Carta's original output, untouched)
     Cells_singleTargetData_R<r>-C<c>-F<f>-Z<z>-T<t>.csv
 ```
@@ -84,6 +86,8 @@ Output:
 6. Run. A summary dialog at the end tells you how many cells were picked per site, and flags any that didn't reach N.
 
 The picks are produced from a fixed random seed (42) in the script, so re-running with the same settings gives you the same picks. To draw a different random sample, edit the `seed` constant near the top of the macro.
+
+On rerun, the macro only overwrites `TargetData/` if it can verify that `TargetData/` still matches the previous `TargetData_curated/` mirror. If IN Carta has regenerated a new `TargetData/` in the same results folder, the macro aborts instead of deleting it.
 
 ## Before trusting it in production
 
