@@ -549,7 +549,7 @@ def _assert_previous_curation(cur_dir, audit_dir):
 
 
 def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42,
-                         neighbourhood=2.0, stage_margin=0.05, run_note="", base=None):
+                         neighbourhood=2.0, stage_margin=0.05, run_note="", base=None, progress=None):
     """Curate and write the result IN PLACE, following the v1 folder convention.
 
     The first run renames IN Carta's `TargetData/` to `TargetData_original/` and never
@@ -582,7 +582,7 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
             os.makedirs(d)
 
     res = curate(orig_dir, gate_spec, fov_px=fov_px, sample_size=sample_size, seed=seed,
-                 neighbourhood=neighbourhood, stage_margin=stage_margin, base=base)
+                 neighbourhood=neighbourhood, stage_margin=stage_margin, base=base, progress=progress)
     base, header = res["base"], res["header"]
 
     changes = [u"ZMB MD HCS target curation changes",
@@ -615,7 +615,7 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
 # 10. Curate - run the whole pipeline over every well                         #
 # --------------------------------------------------------------------------- #
 def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
-           neighbourhood=2.0, stage_margin=0.05, out_csv=None, base=None):
+           neighbourhood=2.0, stage_margin=0.05, out_csv=None, base=None, progress=None):
     """Curate every well (gate -> SURS -> disjoint FOVs). `base` is the object class to
     gate & acquire (default: the first channel). The SURS grid spans the whole scanned
     area (all base objects), so the sample is spread over the well the overview imaged,
@@ -638,7 +638,10 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
             files_by_site.setdefault(_site_of(fn), {})[signal_name(fn)] = fn
 
     header, wells, fov_rows = None, [], []
-    for well_index, site in enumerate(sorted(files_by_site)):
+    sites = sorted(files_by_site)
+    for well_index, site in enumerate(sites):
+        if progress:
+            progress(well_index + 1, len(sites))       # for the caller's status/heartbeat
         files = files_by_site[site]
         if base not in files:
             continue
@@ -723,6 +726,8 @@ def _render_report(res, report_dir, fov_px):
     for i, well in enumerate(wells):
         IJ.showStatus("MD HCS curation: rendering report %d/%d" % (i + 1, len(wells)))
         IJ.showProgress(i, len(wells))
+        if (i + 1) == len(wells) or (i + 1) % 10 == 0:
+            IJ.log("  ...rendered %d/%d reports" % (i + 1, len(wells)))
         render(well)
     IJ.showProgress(1.0)
 
@@ -799,11 +804,16 @@ def _run_curation(results_path, gate_spec, base, objective, overview_desc,
     IJ.log("  overview %gx changer %gx binning %d -> target %s FOV=%.0f montage px"
            % (mag_ov, changer_ov, binning_ov, objective, fov_px))
 
+    def tick(done, total):                             # Log heartbeat + status-bar progress
+        IJ.showProgress(done, total)
+        if done == total or done % 10 == 0:
+            IJ.log("  ...curated %d/%d wells" % (done, total))
+
     IJ.log("  working - curating wells (reading CSVs, sampling, placing FOVs)...")
     IJ.showStatus("MD HCS curation: curating wells...")
     res, cur_dir, audit_dir = write_curated_output(
         results_path, gate_spec, fov_px, sample_size, seed, neighbourhood, stage_margin,
-        run_note=str(Date()), base=base)
+        run_note=str(Date()), base=base, progress=tick)
 
     IJ.log("  working - rendering %d per-well reports + plate overview..." % len(res["wells"]))
     report_dir = os.path.join(audit_dir, "report")
