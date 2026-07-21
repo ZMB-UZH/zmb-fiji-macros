@@ -799,11 +799,13 @@ def _run_curation(results_path, gate_spec, base, objective, overview_desc,
     IJ.log("  overview %gx changer %gx binning %d -> target %s FOV=%.0f montage px"
            % (mag_ov, changer_ov, binning_ov, objective, fov_px))
 
+    IJ.log("  working - curating wells (reading CSVs, sampling, placing FOVs)...")
     IJ.showStatus("MD HCS curation: curating wells...")
     res, cur_dir, audit_dir = write_curated_output(
         results_path, gate_spec, fov_px, sample_size, seed, neighbourhood, stage_margin,
         run_note=str(Date()), base=base)
 
+    IJ.log("  working - rendering %d per-well reports + plate overview..." % len(res["wells"]))
     report_dir = os.path.join(audit_dir, "report")
     if not os.path.isdir(report_dir):
         os.makedirs(report_dir)
