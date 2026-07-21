@@ -762,9 +762,11 @@ def _run_curation(results_path, gate_spec, objective, overview_desc,
 
 
 def run_macro():
+    from ij import IJ
     from ij.gui import GenericDialog
 
     results_path = results_dir.getAbsolutePath()
+    IJ.log("MD HCS curation: results folder = " + results_path)
     overview_desc = overview_from_results(results_path)     # found via the InCarta metadata
     need_overview = overview_scale(overview_desc)[0] <= 0   # not reachable next to the results
 
@@ -781,7 +783,9 @@ def run_macro():
     gd.addMessage("Target acquisition")                                   # section 3
     gd.addChoice("Objective", _OBJECTIVE_ORDER, "60x")
     if need_overview:                                                     # fallback if not auto-found
-        gd.addMessage("Overview image not found next to the results - select one:")
+        gd.addMessage("Overview image not found under the selected results folder:")
+        gd.addMessage(results_path)
+        gd.addMessage("(Cancel and pick the original results folder, or select the image below.)")
         gd.addFileField("Overview image", "")
     gd.addMessage("Parameters")                                           # section 4
     gd.addNumericField("Cells per well (min)", 5, 0)
