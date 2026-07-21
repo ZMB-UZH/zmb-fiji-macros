@@ -31,9 +31,9 @@ run preserves IN Carta's `TargetData/` as `TargetData_original/`; every run rewr
 `TargetData/` from scratch with the curated per-site CSVs (the generated FOV-centre
 rows MetaXpress re-images) and mirrors them into `TargetData_curated/` with a
 `curation_changes.csv` audit log (positives / eligible / acquired / extra / fovs per
-site) and a per-well overlay PNG under `report/`. A rerun refuses to overwrite
-`TargetData/` unless it still matches the last curated mirror, so newly regenerated
-IN Carta output is never clobbered. `acquired` = sampled target cells (imaged whole);
+site), a per-well overlay PNG under `report/`, and a whole-plate `plate_overview.png`.
+A rerun refuses to overwrite `TargetData/` unless it still matches the last curated
+mirror, so newly regenerated IN Carta output is never clobbered. `acquired` = sampled target cells (imaged whole);
 `extra` = bonus positives that also fall entirely inside a field.
 
 In Fiji you point at the InCarta results folder, then a dialog assembles the run in
@@ -721,6 +721,56 @@ def _render_report(res, report_dir, fov_px):
         render(well)
 
 
+def _render_plate_overview(res, path, fov_px):
+    """One montage of the whole plate: a panel per well (laid out by plate row/column)
+    with grey nuclei / orange positives / green extras / red sampled / blue FOV boxes,
+    for a bird's-eye check of the curation. Fiji-only (ImageJ ColorProcessor)."""
+    from ij import IJ, ImagePlus
+    from ij.process import ColorProcessor
+    from java.awt import Color, Font
+
+    def rc(site):
+        r, c = site.split("-")[0], site.split("-")[1]
+        return int(r[1:]), int(c[1:])
+
+    rows = sorted(set(rc(w["site"])[0] for w in res["wells"]))
+    cols = sorted(set(rc(w["site"])[1] for w in res["wells"]))
+    if not rows or not cols:
+        return
+    panel, pad, top = 300, 6, 22
+    ip = ColorProcessor(len(cols) * panel, len(rows) * panel)
+    ip.setColor(Color.WHITE); ip.fill()
+    ip.setFont(Font("SansSerif", Font.PLAIN, 13))
+    grey, orange, green, red, blue = (Color(210, 210, 210), Color(244, 165, 130),
+                                      Color(26, 152, 80), Color(202, 0, 32), Color(5, 113, 176))
+    for w in res["wells"]:
+        r, c = rc(w["site"])
+        ox, oy = cols.index(c) * panel, rows.index(r) * panel
+        ip.setColor(Color(170, 170, 170)); ip.drawRect(ox, oy, panel - 1, panel - 1)
+        ip.setColor(Color.BLACK)
+        ip.drawString("%s  n=%d ex=%d" % (w["site"].split("-F")[0], len(w["acquired"]), w["extra"]),
+                      ox + pad, oy + top - 5)
+        coords = [cc for b in w["base"] for cc in (b[0] + b[2], b[1] + b[3])]
+        scale = (panel - 2 * pad - top) / (max(coords) if coords else 1.0)
+
+        def put(bs, colour, rad):
+            ip.setColor(colour)
+            for b in bs:
+                x = ox + pad + int((b[0] + b[2] / 2.0) * scale)
+                y = oy + top + int((b[1] + b[3] / 2.0) * scale)
+                ip.fillOval(x - rad, y - rad, 2 * rad + 1, 2 * rad + 1)
+        put(w["base"], grey, 0)
+        put(w["selected"], orange, 1)
+        put(w["extra_boxes"], green, 2)
+        put(w["acquired"], red, 2)
+        ip.setColor(blue)
+        f = int(fov_px * scale)
+        for t in w["tiles"]:
+            ip.drawRect(ox + pad + int(t["cx"] * scale - f / 2.0),
+                        oy + top + int(t["cy"] * scale - f / 2.0), f, f)
+    IJ.saveAs(ImagePlus("plate", ip), "PNG", path)
+
+
 def _run_curation(results_path, gate_spec, objective, overview_desc,
                   sample_size, seed, neighbourhood, stage_margin):
     """Infer the FOV size from the objective + overview, write the curated output in
@@ -751,6 +801,7 @@ def _run_curation(results_path, gate_spec, objective, overview_desc,
     if not os.path.isdir(report_dir):
         os.makedirs(report_dir)
     _render_report(res, report_dir, fov_px)
+    _render_plate_overview(res, os.path.join(audit_dir, "plate_overview.png"), fov_px)
 
     acquired = sum(len(w["acquired"]) for w in res["wells"])
     extra = sum(w["extra"] for w in res["wells"])
