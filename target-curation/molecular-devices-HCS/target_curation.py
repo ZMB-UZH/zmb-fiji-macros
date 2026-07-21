@@ -7,11 +7,12 @@ Molecular Devices ImageXpress / IN Carta writes one CSV of segmented objects per
 signal per well. This picks, per well, a small representative set of cells to
 re-image at high magnification, in three steps:
 
-  1. GATE the objects of interest. The base object (the FIRST channel, the nuclei) is
-     kept when it is single / double / triple positive - i.e. its box overlaps an
-     object of every 'yes' signal and none of the 'no' signals. In Fiji the marker
-     classes are discovered from the data and their roles (positive / negative /
-     ignore) are chosen in a dialog; the base is always the first channel.
+  1. GATE the objects of interest. One class is the base object (the thing gated and
+     re-imaged, e.g. the nuclei); it is kept when it is single / double / triple
+     positive - i.e. its box overlaps an object of every 'yes' signal and none of the
+     'no' signals. In Fiji every class found in the data gets its own dropdown: mark
+     one class as the object (base) and each of the rest positive / negative / ignore
+     (base defaults to the first channel).
 
   2. SAMPLE ~`sample_size` of them by SURS (Systematic Uniform Random Sampling, the
      2D stereological grid): lay a grid of ~n frames over the scanned area with ONE
@@ -548,7 +549,7 @@ def _assert_previous_curation(cur_dir, audit_dir):
 
 
 def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42,
-                         neighbourhood=2.0, stage_margin=0.05, run_note=""):
+                         neighbourhood=2.0, stage_margin=0.05, run_note="", base=None):
     """Curate and write the result IN PLACE, following the v1 folder convention.
 
     The first run renames IN Carta's `TargetData/` to `TargetData_original/` and never
@@ -581,7 +582,7 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
             os.makedirs(d)
 
     res = curate(orig_dir, gate_spec, fov_px=fov_px, sample_size=sample_size, seed=seed,
-                 neighbourhood=neighbourhood, stage_margin=stage_margin)
+                 neighbourhood=neighbourhood, stage_margin=stage_margin, base=base)
     base, header = res["base"], res["header"]
 
     changes = [u"ZMB MD HCS target curation changes",
@@ -614,16 +615,17 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
 # 10. Curate - run the whole pipeline over every well                         #
 # --------------------------------------------------------------------------- #
 def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
-           neighbourhood=2.0, stage_margin=0.05, out_csv=None):
-    """Curate every well (gate -> SURS -> disjoint FOVs). Base = first signal. The
-    SURS grid spans the whole scanned area (all nuclei), so the sample is spread over
-    the well the overview imaged, not just where the positives landed. The per-well
-    seed is `seed + well_index`, so wells are reproducible yet decorrelated (SplitMix64
-    makes consecutive seeds independent). Returns a dict with per-well results and
-    generated FOV rows; writes the curated CSV if out_csv is given."""
+           neighbourhood=2.0, stage_margin=0.05, out_csv=None, base=None):
+    """Curate every well (gate -> SURS -> disjoint FOVs). `base` is the object class to
+    gate & acquire (default: the first channel). The SURS grid spans the whole scanned
+    area (all base objects), so the sample is spread over the well the overview imaged,
+    not just where the positives landed. The per-well seed is `seed + well_index`, so
+    wells are reproducible yet decorrelated (SplitMix64 makes consecutive seeds
+    independent). Returns a dict with per-well results and generated FOV rows; writes
+    the curated CSV if out_csv is given."""
     target_dir = find_target_dir(results_dir)
     name_index, order = discover_signals(target_dir)
-    base = order[0]
+    base = base if base in name_index else order[0]
     base_t = name_index[base]
     require = parse_gate(gate_spec)
     unknown = [s for s in require if s not in name_index]
@@ -775,7 +777,7 @@ def _render_plate_overview(res, path, fov_px):
     IJ.saveAs(ImagePlus("plate", ip), "PNG", path)
 
 
-def _run_curation(results_path, gate_spec, objective, overview_desc,
+def _run_curation(results_path, gate_spec, base, objective, overview_desc,
                   sample_size, seed, neighbourhood, stage_margin):
     """Infer the FOV size from the objective + overview, write the curated output in
     place (v1 convention), and render the per-well overlays. run_macro collects the
@@ -800,7 +802,7 @@ def _run_curation(results_path, gate_spec, objective, overview_desc,
     IJ.showStatus("MD HCS curation: curating wells...")
     res, cur_dir, audit_dir = write_curated_output(
         results_path, gate_spec, fov_px, sample_size, seed, neighbourhood, stage_margin,
-        run_note=str(Date()))
+        run_note=str(Date()), base=base)
 
     report_dir = os.path.join(audit_dir, "report")
     if not os.path.isdir(report_dir):
@@ -833,13 +835,14 @@ def run_macro():
     # discover the marker classes from the ORIGINAL data (preserved on the first run)
     orig = os.path.join(results_path, "TargetData_original")
     scan_dir = orig if os.path.isdir(orig) else find_target_dir(results_path)
-    _, order = discover_signals(scan_dir)
-    base, markers = order[0], order[1:]           # base = first channel (the nuclei)
+    _, order = discover_signals(scan_dir)          # the classes (groups) found in the data
 
     gd = GenericDialog("MD HCS target curation")
-    gd.addMessage("Select positives   (base object, gated: %s)" % base)   # section 2
-    for sig in markers:
-        gd.addChoice(sig, ["ignore", "positive", "negative"], "ignore")
+    gd.addMessage("Classes  -  mark ONE as the object (base to gate & acquire),")   # section 2
+    gd.addMessage("the rest positive / negative / ignore:")
+    for sig in order:                              # one pull-down per class, however many
+        gd.addChoice(sig, ["object", "positive", "negative", "ignore"],
+                     "object" if sig == order[0] else "ignore")
     gd.addMessage("Target acquisition")                                   # section 3
     gd.addChoice("Objective", _OBJECTIVE_ORDER, "60x")
     if need_overview:                                                     # fallback if not auto-found
@@ -856,7 +859,7 @@ def run_macro():
     if gd.wasCanceled():
         return
 
-    roles = dict((sig, gd.getNextChoice()) for sig in markers)
+    roles = dict((sig, gd.getNextChoice()) for sig in order)
     objective = gd.getNextChoice()
     if need_overview:
         overview_desc = read_image_description(gd.getNextString())
@@ -864,9 +867,13 @@ def run_macro():
     neighbourhood = gd.getNextNumber() / 100.0
     stage_margin = gd.getNextNumber() / 100.0
     seed = int(gd.getNextNumber())
-    gate_spec = build_gate_spec(markers, roles)
 
-    _run_curation(results_path, gate_spec, objective, overview_desc,
+    objects = [s for s in order if roles[s] == "object"]      # the class marked 'object'
+    base = objects[0] if objects else order[0]
+    markers = [s for s in order if s != base]
+    gate_spec = build_gate_spec(markers, roles)               # markers -> yes/no/ignore
+
+    _run_curation(results_path, gate_spec, base, objective, overview_desc,
                   sample_size, seed, neighbourhood, stage_margin)
 
 
@@ -905,6 +912,8 @@ def run_tests():
     check("gate builder -> spec (channel order, ignore dropped)",
           build_gate_spec(["A", "B", "C"], {"A": "positive", "B": "ignore", "C": "negative"}), "A:yes; C:no")
     check("gate builder all-ignore -> empty", build_gate_spec(["A"], {"A": "ignore"}), "")
+    check("gate builder ignores the 'object' role",
+          build_gate_spec(["A", "B"], {"A": "object", "B": "positive"}), "B:yes")
     check("gate builder round-trips via parse_gate",
           parse_gate(build_gate_spec(["mScarlet cells"], {"mScarlet cells": "positive"})), {"mScarlet cells": True})
 
@@ -1039,6 +1048,8 @@ def run_tests():
         check("3 positives -> 3 disjoint FOV rows", (len(rr), n_fov), (3, 3))
         res2, _, _ = write_curated_output(tmp, "mScarlet cells:yes", 100.0, sample_size=5, seed=1, run_note="t2")
         check("rerun allowed (matches mirror) + reproduces", len(res2["wells"][0]["tiles"]), n_fov)
+        rb = curate(os.path.join(tmp, "TargetData_original"), "DAPI:yes", fov_px=100.0, base="mScarlet cells")
+        check("curate honours a chosen base object (not just the first channel)", rb["base"], "mScarlet cells")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
