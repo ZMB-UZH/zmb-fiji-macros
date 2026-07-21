@@ -717,8 +717,12 @@ def _render_report(res, report_dir, fov_px):
         IJ.saveAs(ImagePlus(well["site"], ip), "PNG",
                   os.path.join(report_dir, "report_%s.png" % well["site"]))
 
-    for well in res["wells"]:
+    wells = res["wells"]
+    for i, well in enumerate(wells):
+        IJ.showStatus("MD HCS curation: rendering report %d/%d" % (i + 1, len(wells)))
+        IJ.showProgress(i, len(wells))
         render(well)
+    IJ.showProgress(1.0)
 
 
 def _render_plate_overview(res, path, fov_px):
@@ -793,6 +797,7 @@ def _run_curation(results_path, gate_spec, objective, overview_desc,
     IJ.log("  overview %gx changer %gx binning %d -> target %s FOV=%.0f montage px"
            % (mag_ov, changer_ov, binning_ov, objective, fov_px))
 
+    IJ.showStatus("MD HCS curation: curating wells...")
     res, cur_dir, audit_dir = write_curated_output(
         results_path, gate_spec, fov_px, sample_size, seed, neighbourhood, stage_margin,
         run_note=str(Date()))
@@ -801,7 +806,9 @@ def _run_curation(results_path, gate_spec, objective, overview_desc,
     if not os.path.isdir(report_dir):
         os.makedirs(report_dir)
     _render_report(res, report_dir, fov_px)
+    IJ.showStatus("MD HCS curation: rendering plate overview...")
     _render_plate_overview(res, os.path.join(audit_dir, "plate_overview.png"), fov_px)
+    IJ.showStatus("MD HCS curation: done - see the Log")
 
     acquired = sum(len(w["acquired"]) for w in res["wells"])
     extra = sum(w["extra"] for w in res["wells"])
