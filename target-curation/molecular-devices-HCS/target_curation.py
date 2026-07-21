@@ -659,8 +659,9 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
         # positive cell that happens to fall entirely inside a field (free extra
         # observations, especially at low mag where the field is large)
         half = _usable_half(fov_px, stage_margin)
-        captured = sum(1 for b in selected
-                       if any(_fully_inside(b, t["cx"], t["cy"], half) for t in tiles))
+        captured_boxes = [b for b in selected
+                          if any(_fully_inside(b, t["cx"], t["cy"], half) for t in tiles)]
+        extra_boxes = [b for b in captured_boxes if b not in acquired]   # captured but not sampled
 
         template = base_rows[0] if base_rows else {}
         well_fov_rows = [fov_row(template, base_t, t["cx"], t["cy"],
@@ -668,10 +669,10 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
                          for i, t in enumerate(tiles)]
         fov_rows.extend(well_fov_rows)
         wells.append({"site": site, "base": base_boxes, "selected": selected,
-                      "acquired": acquired, "captured": captured,
-                      "extra": captured - len(acquired), "eligible": n_eligible,
-                      "sample_short": n_eligible < sample_size, "tiles": tiles,
-                      "fov_rows": well_fov_rows})
+                      "acquired": acquired, "captured": len(captured_boxes),
+                      "extra": len(extra_boxes), "extra_boxes": extra_boxes,
+                      "eligible": n_eligible, "sample_short": n_eligible < sample_size,
+                      "tiles": tiles, "fov_rows": well_fov_rows})
 
     if out_csv and header:
         _write_csv(out_csv, header, fov_rows)
@@ -691,8 +692,8 @@ def _render_report(res, report_dir, fov_px):
     from ij.process import ColorProcessor
     from java.awt import Color
     canvas = 1040
-    grey, orange, red, blue = (Color(225, 225, 225), Color(244, 165, 130),
-                               Color(202, 0, 32), Color(5, 113, 176))
+    grey, orange, green, red, blue = (Color(225, 225, 225), Color(244, 165, 130),
+                                      Color(26, 152, 80), Color(202, 0, 32), Color(5, 113, 176))
 
     def render(well):
         coords = [c for b in well["base"] for c in (b[0] + b[2], b[1] + b[3])]
@@ -707,6 +708,7 @@ def _render_report(res, report_dir, fov_px):
                             int((b[1] + b[3] / 2.0) * scale) - r, 2 * r, 2 * r)
         dots(well["base"], grey, 1)          # all nuclei
         dots(well["selected"], orange, 3)    # positive population
+        dots(well["extra_boxes"], green, 3)  # bonus positives also captured in a FOV
         dots(well["acquired"], red, 4)       # the sampled cells we image
         ip.setColor(blue); ip.setLineWidth(2)
         f = int(fov_px * scale)
@@ -1004,6 +1006,7 @@ def run_tests():
         check("plate acquired (golden)", acquired, GOLDEN_ACQUIRED)
         check("captured == acquired + extra", captured, acquired + extra)
         check("plate extra/bonus (golden)", extra, GOLDEN_EXTRA)
+        check("extra_boxes count matches extra", sum(len(w["extra_boxes"]) for w in res["wells"]), GOLDEN_EXTRA)
         check("plate captured (golden)", captured, GOLDEN_CAPTURED)
         check("plate FOVs (golden)", fovs, GOLDEN_FOVS)
     else:
