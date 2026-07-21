@@ -1,11 +1,5 @@
-#@ File    (label="Analysis results folder", style="directory") results_dir
-#@ Integer (label="Cells per well", value=5, min=1) sample_size
-#@ Integer (label="Random seed", value=42) seed
-#@ String  (label="Target objective", choices={"2x","4x","10x","20x","40x","60x","60x + 1.5x changer"}, value="60x") target_objective
-#@ File    (label="Overview image (reads objective + scale)", style="file") overview_image
-#@ Float   (label="Neighbourhood (clear radii around each cell)", value=2.0, min=0) neighbourhood
-#@ Float   (label="Stage-accuracy margin (fraction per side)", value=0.05, min=0, max=0.49) stage_margin
-#@ File    (label="Output folder", style="directory") out_dir
+#@ File (label="InCarta analysis results folder", style="directory") results_dir
+#@ File (label="Overview image (reads objective + scale)", style="file") overview_image
 
 """
 MD HCS target curation - single-file Fiji macro (Jython 2.7) and CPython module.
@@ -33,17 +27,22 @@ re-image at high magnification, in three steps:
      imaged twice. A sampled cell too close to an already-placed FOV to be framed
      without overlap is dropped (rare, since the sample is spread).
 
-OUTPUT: a curated CSV of generated FOV rows (hand-load into MetaXpress), a per-well
-summary CSV, and a per-well visual report (PNG: nuclei / positives / sampled / FOVs).
-The summary reports, per well, `acquired` (the sampled target cells, always imaged
-whole) and `extra` (BONUS positives that also fall entirely inside a field, uncut -
-not sampled targets; grows at low mag where fields are large). `captured` = acquired
-+ extra = every positive imaged whole.
+OUTPUT follows the v1 convention, written in place next to the analysis: the first
+run preserves IN Carta's `TargetData/` as `TargetData_original/`; every run rewrites
+`TargetData/` from scratch with the curated per-site CSVs (the generated FOV-centre
+rows MetaXpress re-images) and mirrors them into `TargetData_curated/` with a
+`curation_changes.csv` audit log (positives / eligible / acquired / extra / fovs per
+site) and a per-well overlay PNG under `report/`. A rerun refuses to overwrite
+`TargetData/` unless it still matches the last curated mirror, so newly regenerated
+IN Carta output is never clobbered. `acquired` = sampled target cells (imaged whole);
+`extra` = bonus positives that also fall entirely inside a field.
 
-In Fiji the target FOV size is not typed in: pick the target objective and point at
-one overview image. The FOV footprint (in overview-montage pixels) is inferred from
-the overview's own metadata - its objective, changer, binning and sensor region -
-so it adapts automatically when the overview is taken at a different magnification.
+In Fiji you first point at the InCarta results folder and an overview image, then a
+dialog assembles the run in sections: one dropdown per marker class found in the data
+to set positives (positive / negative / ignore); the target objective; and the
+parameters (cells per well, neighbourhood as % of the cell radius, stage margin, seed).
+The FOV size is inferred from the overview image's own metadata (objective, changer,
+binning, sensor region), so it adapts when the overview magnification changes.
 
 The file is BOTH the Fiji entry (SciJava params above) and its own test suite: run
 `python target_curation.py` in CPython to run the tests; open/run it in Fiji to
@@ -95,10 +94,11 @@ def _has_csv(d):
 
 
 def find_target_dir(path):
-    """Locate the TargetData folder: `path` if it is one, else a TargetData child,
-    else one analysis-folder level down. Preferred over sibling ObjectData/metadata
-    CSVs, which also live in the analysis folder but are not the targets."""
-    if os.path.basename(os.path.normpath(path)) == "TargetData" and _has_csv(path):
+    """Locate the TargetData folder: `path` if it is one (or the TargetData_original
+    that a previous run renamed the source to), else a TargetData child, else one
+    analysis-folder level down. Preferred over sibling ObjectData/metadata CSVs, which
+    also live in the analysis folder but are not the targets."""
+    if os.path.basename(os.path.normpath(path)) in ("TargetData", "TargetData_original") and _has_csv(path):
         return path
     cand = os.path.join(path, "TargetData")
     if _has_csv(cand):
@@ -200,6 +200,7 @@ def build_gate_spec(markers, roles):
 _OBJECTIVES = {"2x": (2.0, 1.0), "4x": (4.0, 1.0), "10x": (10.0, 1.0),
                "20x": (20.0, 1.0), "40x": (40.0, 1.0), "60x": (60.0, 1.0),
                "60x + 1.5x changer": (60.0, 1.5)}
+_OBJECTIVE_ORDER = ["2x", "4x", "10x", "20x", "40x", "60x", "60x + 1.5x changer"]  # dialog order
 
 
 def read_image_description(path):
@@ -477,6 +478,93 @@ def _write_csv(path, header, rows):
             fh.write(u",".join(field(r.get(c, u"")) for c in header) + u"\r\n")
 
 
+def _read_bytes(path):
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def _assert_previous_curation(cur_dir, audit_dir):
+    """Refuse to overwrite TargetData/ on a rerun unless it is still byte-for-byte the
+    last TargetData_curated/ mirror - so newly regenerated IN Carta output (which would
+    NOT match the mirror) is never silently clobbered."""
+    if not os.path.isdir(cur_dir):
+        return
+    if not (os.path.isdir(audit_dir) and os.path.isfile(audit_dir + "curation_changes.csv")):
+        raise ValueError("TargetData_original/ exists but the TargetData_curated/ mirror is "
+                         "missing; refusing to overwrite TargetData/ (it may be new IN Carta output).")
+    for name in os.listdir(cur_dir):
+        src = cur_dir + name
+        if not os.path.isfile(src):
+            continue
+        mirror = audit_dir + name
+        if not os.path.isfile(mirror) or _read_bytes(src) != _read_bytes(mirror):
+            raise ValueError("TargetData/ differs from the last TargetData_curated/ mirror; "
+                             "refusing to overwrite possible new IN Carta output: " + name)
+
+
+def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42,
+                         neighbourhood=2.0, stage_margin=0.05, run_note=""):
+    """Curate and write the result IN PLACE, following the v1 folder convention.
+
+    The first run renames IN Carta's `TargetData/` to `TargetData_original/` and never
+    touches it again; every run reads from there and rewrites `TargetData/` from scratch
+    with the curated per-site CSVs (the generated FOV-centre rows, one file per site,
+    named like the base target's original file). The same files are mirrored into
+    `TargetData_curated/`, with a `curation_changes.csv` audit log. A rerun is refused
+    unless `TargetData/` still matches the previous mirror, so regenerated IN Carta
+    output is not clobbered. `run_note` is the timestamp string for the log (the caller
+    supplies it, so this stays portable). Returns (res, cur_dir, audit_dir)."""
+    sep = os.sep
+    base_dir = results_path if results_path.endswith(sep) else results_path + sep
+    orig_dir = base_dir + "TargetData_original" + sep
+    cur_dir = base_dir + "TargetData" + sep
+    audit_dir = base_dir + "TargetData_curated" + sep
+
+    if not os.path.isdir(orig_dir):                       # first run: preserve the originals
+        if not os.path.isdir(cur_dir):
+            raise ValueError("No TargetData folder to curate at: " + cur_dir)
+        os.rename(cur_dir.rstrip(sep), orig_dir.rstrip(sep))
+    else:                                                 # rerun: guard against clobbering new data
+        _assert_previous_curation(cur_dir, audit_dir)
+
+    for d in (cur_dir, audit_dir):                        # rewrite both from scratch (files only)
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if os.path.isfile(d + f):
+                    os.remove(d + f)
+        else:
+            os.makedirs(d)
+
+    res = curate(orig_dir, gate_spec, fov_px=fov_px, sample_size=sample_size, seed=seed,
+                 neighbourhood=neighbourhood, stage_margin=stage_margin)
+    base, header = res["base"], res["header"]
+
+    changes = [u"ZMB MD HCS target curation changes",
+               u"Run\t" + run_note,
+               u"Curated target\t" + base,
+               u"Gate\t" + gate_spec,
+               u"Cells per well\t%d" % sample_size,
+               u"Neighbourhood (%% of radius)\t%g" % (neighbourhood * 100.0),
+               u"Stage margin (%% per side)\t%g" % (stage_margin * 100.0),
+               u"Seed\t%d" % seed,
+               u"FOV size (montage px)\t%g" % fov_px,
+               u"Originals\t" + orig_dir,
+               u"Operational TargetData\t" + cur_dir,
+               u"Curated mirror\t" + audit_dir,
+               u"",
+               u"file\tpositives\teligible\tacquired\textra\tfovs\tsample_short"]
+    for well in res["wells"]:
+        fname = base + _SITE_KEY + well["site"] + ".csv"
+        _write_csv(cur_dir + fname, header, well["fov_rows"])
+        _write_csv(audit_dir + fname, header, well["fov_rows"])
+        changes.append(u"%s\t%d\t%d\t%d\t%d\t%d\t%s" % (
+            fname, len(well["selected"]), well["eligible"], len(well["acquired"]),
+            well["extra"], len(well["tiles"]), well["sample_short"]))
+    with io.open(audit_dir + "curation_changes.csv", "w", encoding="utf-8", newline="") as fh:
+        fh.write(u"\r\n".join(changes) + u"\r\n")
+    return res, cur_dir, audit_dir
+
+
 # --------------------------------------------------------------------------- #
 # 10. Curate - run the whole pipeline over every well                         #
 # --------------------------------------------------------------------------- #
@@ -530,13 +618,15 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
                        if any(_fully_inside(b, t["cx"], t["cy"], half) for t in tiles))
 
         template = base_rows[0] if base_rows else {}
-        for t in tiles:
-            fov_rows.append(fov_row(template, base_t, t["cx"], t["cy"],
-                                    "FOV_%d" % (len(fov_rows) + 1)))
+        well_fov_rows = [fov_row(template, base_t, t["cx"], t["cy"],
+                                 "FOV_%d" % (len(fov_rows) + i + 1))
+                         for i, t in enumerate(tiles)]
+        fov_rows.extend(well_fov_rows)
         wells.append({"site": site, "base": base_boxes, "selected": selected,
                       "acquired": acquired, "captured": captured,
                       "extra": captured - len(acquired), "eligible": n_eligible,
-                      "sample_short": n_eligible < sample_size, "tiles": tiles})
+                      "sample_short": n_eligible < sample_size, "tiles": tiles,
+                      "fov_rows": well_fov_rows})
 
     if out_csv and header:
         _write_csv(out_csv, header, fov_rows)
@@ -549,25 +639,17 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
 # ImageJ imports live inside these functions so the module still imports in     #
 # plain CPython (for the tests).                                               #
 # --------------------------------------------------------------------------- #
-def _run_curation(results_path, gate_spec, out, fov_px, sample_size, seed, neighbourhood, stage_margin):
-    """Curate, then write the curated CSV, per-well report PNGs and summary CSV. Split
-    out of run_macro so it can be driven headlessly - the class dialog cannot be."""
+def _render_report(res, report_dir, fov_px):
+    """One overlay PNG per well (grey nuclei / orange positives / red sampled / blue
+    FOV boxes) written under the curated mirror. Fiji-only (ImageJ ColorProcessor)."""
     from ij import IJ, ImagePlus
     from ij.process import ColorProcessor
     from java.awt import Color
-
-    curated = os.path.join(out, "TargetData_curated_FOVs.csv")
-    res = curate(results_path, gate_spec, fov_px=fov_px, sample_size=sample_size, seed=seed,
-                 neighbourhood=neighbourhood, stage_margin=stage_margin, out_csv=curated)
-
-    report_dir = os.path.join(out, "report")
-    if not os.path.isdir(report_dir):
-        os.makedirs(report_dir)
     canvas = 1040
     grey, orange, red, blue = (Color(225, 225, 225), Color(244, 165, 130),
                                Color(202, 0, 32), Color(5, 113, 176))
 
-    def render(well, path):
+    def render(well):
         coords = [c for b in well["base"] for c in (b[0] + b[2], b[1] + b[3])]
         scale = canvas / (max(coords) if coords else 1.0)
         ip = ColorProcessor(canvas, canvas)
@@ -585,16 +667,36 @@ def _run_curation(results_path, gate_spec, out, fov_px, sample_size, seed, neigh
         f = int(fov_px * scale)
         for t in well["tiles"]:
             ip.drawRect(int(t["cx"] * scale - f / 2.0), int(t["cy"] * scale - f / 2.0), f, f)
-        IJ.saveAs(ImagePlus(well["site"], ip), "PNG", path)
+        IJ.saveAs(ImagePlus(well["site"], ip), "PNG",
+                  os.path.join(report_dir, "report_%s.png" % well["site"]))
 
-    summary = [u"well,positives,eligible,acquired,extra,fovs,sample_short"]
     for well in res["wells"]:
-        summary.append(u"%s,%d,%d,%d,%d,%d,%s" % (
-            well["site"], len(well["selected"]), well["eligible"], len(well["acquired"]),
-            well["extra"], len(well["tiles"]), well["sample_short"]))
-        render(well, os.path.join(report_dir, "report_%s.png" % well["site"]))
-    with io.open(os.path.join(out, "curation_summary.csv"), "w", encoding="utf-8", newline="") as fh:
-        fh.write(u"\r\n".join(summary) + u"\r\n")
+        render(well)
+
+
+def _run_curation(results_path, gate_spec, objective, overview_desc,
+                  sample_size, seed, neighbourhood, stage_margin):
+    """Infer the FOV size from the objective + overview, write the curated output in
+    place (v1 convention), and render the per-well overlays. run_macro collects the
+    arguments interactively; this does the work so it can also be driven headlessly."""
+    from ij import IJ
+    from java.util import Date
+
+    mag_t, changer_t = _OBJECTIVES[objective]
+    mag_ov, changer_ov, binning_ov, region_px = overview_scale(overview_desc)
+    fov_px = fov_px_for(mag_t, changer_t, mag_ov, changer_ov, binning_ov, region_px)
+    IJ.log("MD HCS curation: gate='%s'" % gate_spec)
+    IJ.log("  overview %gx changer %gx binning %d -> target %s FOV=%.0f montage px"
+           % (mag_ov, changer_ov, binning_ov, objective, fov_px))
+
+    res, cur_dir, audit_dir = write_curated_output(
+        results_path, gate_spec, fov_px, sample_size, seed, neighbourhood, stage_margin,
+        run_note=str(Date()))
+
+    report_dir = os.path.join(audit_dir, "report")
+    if not os.path.isdir(report_dir):
+        os.makedirs(report_dir)
+    _render_report(res, report_dir, fov_px)
 
     acquired = sum(len(w["acquired"]) for w in res["wells"])
     extra = sum(w["extra"] for w in res["wells"])
@@ -602,39 +704,48 @@ def _run_curation(results_path, gate_spec, out, fov_px, sample_size, seed, neigh
     under = sum(1 for w in res["wells"] if w["sample_short"])
     IJ.log("  wells=%d acquired=%d extra-whole=%d FOVs=%d under-sampled=%d"
            % (len(res["wells"]), acquired, extra, fovs, under))
-    IJ.log("  curated FOVs -> %s" % curated)
+    IJ.log("  curated TargetData -> %s" % cur_dir)
+    IJ.log("  mirror + changes   -> %s" % audit_dir)
     return res
 
 
 def run_macro():
-    from ij import IJ
     from ij.gui import GenericDialog
 
     results_path = results_dir.getAbsolutePath()
-    _, order = discover_signals(find_target_dir(results_path))
+    overview_desc = read_image_description(overview_image.getAbsolutePath())
+
+    # discover the marker classes from the ORIGINAL data (preserved on the first run)
+    orig = os.path.join(results_path, "TargetData_original")
+    scan_dir = orig if os.path.isdir(orig) else find_target_dir(results_path)
+    _, order = discover_signals(scan_dir)
     base, markers = order[0], order[1:]           # base = first channel (the nuclei)
 
     gd = GenericDialog("MD HCS target curation")
-    gd.addMessage("Base object (gated): " + base)
-    gd.addMessage("Role of each marker class found in the data:")
+    gd.addMessage("Select positives   (base object, gated: %s)" % base)   # section 2
     for sig in markers:
         gd.addChoice(sig, ["ignore", "positive", "negative"], "ignore")
+    gd.addMessage("Target acquisition")                                   # section 3
+    gd.addChoice("Objective", _OBJECTIVE_ORDER, "60x")
+    gd.addMessage("Parameters")                                           # section 4
+    gd.addNumericField("Cells per well (min)", 5, 0)
+    gd.addNumericField("Neighbourhood (% of cell radius)", 200, 0)
+    gd.addNumericField("Stage margin (% per side)", 5, 0)
+    gd.addNumericField("Random seed", 42, 0)
     gd.showDialog()
     if gd.wasCanceled():
         return
+
     roles = dict((sig, gd.getNextChoice()) for sig in markers)
+    objective = gd.getNextChoice()
+    sample_size = int(gd.getNextNumber())
+    neighbourhood = gd.getNextNumber() / 100.0
+    stage_margin = gd.getNextNumber() / 100.0
+    seed = int(gd.getNextNumber())
     gate_spec = build_gate_spec(markers, roles)
 
-    mag_t, changer_t = _OBJECTIVES[target_objective]
-    mag_ov, changer_ov, binning_ov, region_px = overview_scale(
-        read_image_description(overview_image.getAbsolutePath()))
-    fov_px = fov_px_for(mag_t, changer_t, mag_ov, changer_ov, binning_ov, region_px)
-
-    IJ.log("MD HCS curation: base=%s gate='%s'" % (base, gate_spec))
-    IJ.log("  overview %gx changer %gx binning %d -> target %s FOV=%.0f montage px"
-           % (mag_ov, changer_ov, binning_ov, target_objective, fov_px))
-    _run_curation(results_path, gate_spec, out_dir.getAbsolutePath(), fov_px,
-                  int(sample_size), int(seed), neighbourhood, stage_margin)
+    _run_curation(results_path, gate_spec, objective, overview_desc,
+                  sample_size, seed, neighbourhood, stage_margin)
 
 
 # --------------------------------------------------------------------------- #
@@ -745,6 +856,41 @@ def run_tests():
               (10.0, 1.0, 1, 2304))
     else:
         print("  SKIP real overview TIFF (not present)")
+
+    print("v1 output convention (synthetic dataset in a temp folder)")
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        td = os.path.join(tmp, "TargetData")
+        os.makedirs(td)
+        site = "R2-C03-F0-Z0-T0"
+        dapi = ["object_id,well_label,T1$AS_FID_Blob_BoundingBoxX,T1$AS_FID_Blob_BoundingBoxY,"
+                "T1$AS_FID_Blob_BoundingBoxWidth,T1$AS_FID_Blob_BoundingBoxHeight"]
+        dapi += ["%d,B - 3,%d,0,10,10" % (i, i * 100) for i in range(4)]     # 4 nuclei
+        ms = ["object_id,T2$AS_FID_Blob_BoundingBoxX,T2$AS_FID_Blob_BoundingBoxY,"
+              "T2$AS_FID_Blob_BoundingBoxWidth,T2$AS_FID_Blob_BoundingBoxHeight"]
+        ms += ["%d,%d,2,6,6" % (i, i * 100 + 2) for i in range(3)]           # positive on nuclei 0,1,2
+        for name, lines in (("DAPI", dapi), ("mScarlet cells", ms)):
+            with io.open(os.path.join(td, "%s_singleTargetData_%s.csv" % (name, site)),
+                         "w", encoding="utf-8", newline="") as fh:
+                fh.write(u"\r\n".join(lines) + u"\r\n")
+
+        res, cur_dir, audit_dir = write_curated_output(tmp, "mScarlet cells:yes", 100.0,
+                                                       sample_size=5, seed=1, run_note="t")
+        n_fov = len(res["wells"][0]["tiles"])
+        curated = os.path.join(cur_dir, "DAPI_singleTargetData_%s.csv" % site)
+        check("first run preserves originals", os.path.isdir(os.path.join(tmp, "TargetData_original")), True)
+        check("curated per-site file written", os.path.isfile(curated), True)
+        check("mirror + changes log written", os.path.isfile(os.path.join(audit_dir, "curation_changes.csv")), True)
+        check("only the base target lands in TargetData/",
+              os.path.isfile(os.path.join(cur_dir, "mScarlet cells_singleTargetData_%s.csv" % site)), False)
+        ch, rr = read_csv(curated)
+        check("curated header == original (object_id first)", ch[0], "object_id")
+        check("3 positives -> 3 disjoint FOV rows", (len(rr), n_fov), (3, 3))
+        res2, _, _ = write_curated_output(tmp, "mScarlet cells:yes", 100.0, sample_size=5, seed=1, run_note="t2")
+        check("rerun allowed (matches mirror) + reproduces", len(res2["wells"][0]["tiles"]), n_fov)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
     print("real data (auto-skip)")
     real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Results",
