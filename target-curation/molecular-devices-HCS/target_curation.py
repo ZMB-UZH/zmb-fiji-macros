@@ -752,7 +752,7 @@ def _render_plate_overview(res, path, fov_px):
         ox, oy = cols.index(c) * panel, rows.index(r) * panel
         ip.setColor(Color(170, 170, 170)); ip.drawRect(ox, oy, panel - 1, panel - 1)
         ip.setColor(Color.BLACK)
-        ip.drawString("%s  n=%d ex=%d" % (w["site"].split("-F")[0], len(w["acquired"]), w["extra"]),
+        ip.drawString("Row %d Col %d   sampled=%d extra=%d" % (r, c, len(w["acquired"]), w["extra"]),
                       ox + pad, oy + top - 5)
         coords = [cc for b in w["base"] for cc in (b[0] + b[2], b[1] + b[3])]
         scale = (panel - 2 * pad - top) / (max(coords) if coords else 1.0)
