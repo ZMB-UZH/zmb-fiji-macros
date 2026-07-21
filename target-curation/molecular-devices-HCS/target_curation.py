@@ -42,8 +42,10 @@ negative / ignore); the target objective; and the parameters (cells per well,
 neighbourhood as % of the cell radius, stage margin, seed). The FOV size is inferred
 from the overview image's own metadata (objective, changer, binning, sensor region);
 the overview image is located automatically from the InCarta result metadata
-(`result_metadata.csv` names it), so there is no separate image input, and the size
-adapts when the overview magnification changes.
+(`result_metadata.csv` names it, reachable by walking up to the acquisition), so there
+is normally no image input, and the size adapts when the overview magnification
+changes. If the image cannot be found (e.g. the results folder was copied away from
+the acquisition), the dialog asks for it.
 
 The file is BOTH the Fiji entry (SciJava params above) and its own test suite: run
 `python target_curation.py` in CPython to run the tests; open/run it in Fiji to
@@ -764,6 +766,7 @@ def run_macro():
 
     results_path = results_dir.getAbsolutePath()
     overview_desc = overview_from_results(results_path)     # found via the InCarta metadata
+    need_overview = overview_scale(overview_desc)[0] <= 0   # not reachable next to the results
 
     # discover the marker classes from the ORIGINAL data (preserved on the first run)
     orig = os.path.join(results_path, "TargetData_original")
@@ -777,6 +780,9 @@ def run_macro():
         gd.addChoice(sig, ["ignore", "positive", "negative"], "ignore")
     gd.addMessage("Target acquisition")                                   # section 3
     gd.addChoice("Objective", _OBJECTIVE_ORDER, "60x")
+    if need_overview:                                                     # fallback if not auto-found
+        gd.addMessage("Overview image not found next to the results - select one:")
+        gd.addFileField("Overview image", "")
     gd.addMessage("Parameters")                                           # section 4
     gd.addNumericField("Cells per well (min)", 5, 0)
     gd.addNumericField("Neighbourhood (% of cell radius)", 200, 0)
@@ -788,6 +794,8 @@ def run_macro():
 
     roles = dict((sig, gd.getNextChoice()) for sig in markers)
     objective = gd.getNextChoice()
+    if need_overview:
+        overview_desc = read_image_description(gd.getNextString())
     sample_size = int(gd.getNextNumber())
     neighbourhood = gd.getNextNumber() / 100.0
     stage_margin = gd.getNextNumber() / 100.0
