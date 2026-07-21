@@ -1,5 +1,4 @@
 #@ File (label="InCarta analysis results folder", style="directory") results_dir
-#@ File (label="Overview image (reads objective + scale)", style="file") overview_image
 
 """
 MD HCS target curation - single-file Fiji macro (Jython 2.7) and CPython module.
@@ -37,12 +36,14 @@ site) and a per-well overlay PNG under `report/`. A rerun refuses to overwrite
 IN Carta output is never clobbered. `acquired` = sampled target cells (imaged whole);
 `extra` = bonus positives that also fall entirely inside a field.
 
-In Fiji you first point at the InCarta results folder and an overview image, then a
-dialog assembles the run in sections: one dropdown per marker class found in the data
-to set positives (positive / negative / ignore); the target objective; and the
-parameters (cells per well, neighbourhood as % of the cell radius, stage margin, seed).
-The FOV size is inferred from the overview image's own metadata (objective, changer,
-binning, sensor region), so it adapts when the overview magnification changes.
+In Fiji you point at the InCarta results folder, then a dialog assembles the run in
+sections: one dropdown per marker class found in the data to set positives (positive /
+negative / ignore); the target objective; and the parameters (cells per well,
+neighbourhood as % of the cell radius, stage margin, seed). The FOV size is inferred
+from the overview image's own metadata (objective, changer, binning, sensor region);
+the overview image is located automatically from the InCarta result metadata
+(`result_metadata.csv` names it), so there is no separate image input, and the size
+adapts when the overview magnification changes.
 
 The file is BOTH the Fiji entry (SciJava params above) and its own test suite: run
 `python target_curation.py` in CPython to run the tests; open/run it in Fiji to
@@ -257,6 +258,48 @@ def fov_px_for(target_mag, target_changer, mag_ov, changer_ov, binning_ov, regio
     count scaled by the overview-to-target total-magnification ratio (overview
     binning coarsens the montage, so it enlarges the footprint)."""
     return region_px * (mag_ov * changer_ov) / (target_mag * target_changer * binning_ov)
+
+
+def _overview_tiff_path(results_dir):
+    """Path to the overview image, found from the InCarta result metadata (so the
+    operator needn't select it). `result_metadata.csv` / `channel_metadata.csv` in the
+    analysis folder carry a `greyscale_image` name like `timepoint0\\...tif`, relative
+    to the acquisition root; we read it and walk up from the results folder until that
+    file exists. Returns None if it cannot be located."""
+    try:
+        analysis_dir = os.path.dirname(os.path.normpath(find_target_dir(results_dir)))
+    except ValueError:
+        return None
+    for meta in ("result_metadata.csv", "channel_metadata.csv"):
+        path = os.path.join(analysis_dir, meta)
+        if not os.path.isfile(path):
+            continue
+        head, rows = read_csv(path)
+        if "greyscale_image" not in head:
+            continue
+        rel = ""
+        for row in rows:
+            rel = row.get("greyscale_image", "").strip()
+            if rel:
+                break
+        if not rel:
+            continue
+        rel = rel.replace("\\", os.sep).replace("/", os.sep)
+        d = analysis_dir
+        for _ in range(6):                                # walk up to the acquisition root
+            cand = os.path.join(d, rel)
+            if os.path.isfile(cand):
+                return cand
+            d = os.path.dirname(d)
+    return None
+
+
+def overview_from_results(results_dir):
+    """The overview image's MetaXpress ImageDescription (for overview_scale), located
+    automatically from the InCarta result metadata - no separate overview-image input.
+    Empty string if the referenced image cannot be found."""
+    path = _overview_tiff_path(results_dir)
+    return read_image_description(path) if path else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -684,6 +727,13 @@ def _run_curation(results_path, gate_spec, objective, overview_desc,
 
     mag_t, changer_t = _OBJECTIVES[objective]
     mag_ov, changer_ov, binning_ov, region_px = overview_scale(overview_desc)
+    if mag_ov <= 0:
+        IJ.error("MD HCS target curation",
+                 "Could not read the overview objective/scale.\n"
+                 "Expected the InCarta result_metadata.csv (greyscale_image) and the overview\n"
+                 "image reachable by walking up from the results folder - is the acquisition\n"
+                 "(experiment_montage/timepoint0) present next to the analysis?")
+        return None
     fov_px = fov_px_for(mag_t, changer_t, mag_ov, changer_ov, binning_ov, region_px)
     IJ.log("MD HCS curation: gate='%s'" % gate_spec)
     IJ.log("  overview %gx changer %gx binning %d -> target %s FOV=%.0f montage px"
@@ -713,7 +763,7 @@ def run_macro():
     from ij.gui import GenericDialog
 
     results_path = results_dir.getAbsolutePath()
-    overview_desc = read_image_description(overview_image.getAbsolutePath())
+    overview_desc = overview_from_results(results_path)     # found via the InCarta metadata
 
     # discover the marker classes from the ORIGINAL data (preserved on the first run)
     orig = os.path.join(results_path, "TargetData_original")
@@ -856,6 +906,34 @@ def run_tests():
               (10.0, 1.0, 1, 2304))
     else:
         print("  SKIP real overview TIFF (not present)")
+
+    print("overview auto-discovery from the results folder")
+    import tempfile, shutil
+    ov_tmp = tempfile.mkdtemp()
+    try:
+        analysis = os.path.join(ov_tmp, "montage", "Results", "analysis")
+        os.makedirs(os.path.join(analysis, "TargetData"))
+        with io.open(os.path.join(analysis, "TargetData", "DAPI_singleTargetData_S.csv"),
+                     "w", encoding="utf-8", newline="") as fh:
+            fh.write(u"object_id,T1$AS_FID_Blob_BoundingBoxX,T1$AS_FID_Blob_BoundingBoxY,"
+                     u"T1$AS_FID_Blob_BoundingBoxWidth,T1$AS_FID_Blob_BoundingBoxHeight\r\n")
+        with io.open(os.path.join(analysis, "result_metadata.csv"), "w", encoding="utf-8", newline="") as fh:
+            fh.write(u"well_label,greyscale_image\r\nB - 3,timepoint0\\ov.tif\r\n")   # names it, 2 up
+        os.makedirs(os.path.join(ov_tmp, "montage", "timepoint0"))
+        ov = os.path.join(ov_tmp, "montage", "timepoint0", "ov.tif")
+        with io.open(ov, "w", encoding="utf-8") as fh:
+            fh.write(u"x")
+        check("overview image found by walking up from results", _overview_tiff_path(analysis), ov)
+    finally:
+        shutil.rmtree(ov_tmp, ignore_errors=True)
+    real_analysis = os.path.join(
+        r"Z:\transfer\Thom\Nico MD\NB26-15_Overview10x_DAPI-mScarlet_20260713_152811",
+        "experiment_montage", "Results", "mScarlet Cells_2026-Jul-13-17-23-33-077")
+    if os.path.isdir(os.path.join(real_analysis, "TargetData")):
+        check("overview auto-found + scaled from real results",
+              overview_scale(overview_from_results(real_analysis)), (10.0, 1.0, 1, 2304))
+    else:
+        print("  SKIP overview auto-discovery on real results (not present)")
 
     print("v1 output convention (synthetic dataset in a temp folder)")
     import tempfile, shutil
