@@ -362,7 +362,7 @@ def _rng(seed):
 # 6. Sample - Systematic Uniform Random Sampling (2D grid, per-area uniform)   #
 # --------------------------------------------------------------------------- #
 def _surs_sample(elig, centre_x, centre_y, n, seed, search_boxes):
-    """~n eligible cell indices by Systematic Uniform Random Sampling - the 2D
+    """At most n eligible cell indices by Systematic Uniform Random Sampling - the 2D
     stereological grid (per-AREA uniform).
 
     Lay a grid of ~n square frames over the SCANNED AREA (the extent of
@@ -406,6 +406,16 @@ def _surs_sample(elig, centre_x, centre_y, n, seed, search_boxes):
     for key in sorted(frames):
         members = frames[key]
         chosen.append(members[int(draw() * len(members))])
+
+    # Rounding the rectangular grid dimensions can make n_cols * n_rows exceed n
+    # (for example, n=5 on a roughly square well becomes a 2x3 grid). Keep the
+    # spatially uniform frame sample, but randomly discard the surplus frames rather
+    # than returning N+1 cells or truncating in coordinate order.
+    for i in range(len(chosen) - 1, 0, -1):
+        j = int(draw() * (i + 1))
+        chosen[i], chosen[j] = chosen[j], chosen[i]
+    if len(chosen) > n:
+        chosen = chosen[:n]
     return chosen
 
 
@@ -911,9 +921,9 @@ def run_tests():
 
     # Goldens are the values this code produces; pinned so a change is noticed, and
     # verified identical in CPython and Fiji Jython.
-    GOLDEN_TILES = [(400.5, 400.5), (200.5, 1000.5), (200.5, 1400.5),
-                    (800.5, 400.5), (1200.5, 600.5), (1000.5, 1400.5)]
-    GOLDEN_ACQUIRED, GOLDEN_FOVS, GOLDEN_CAPTURED, GOLDEN_EXTRA = 189, 188, 341, 152
+    GOLDEN_TILES = [(800.5, 400.5), (200.5, 1000.5), (1200.5, 600.5),
+                    (1000.5, 1400.5), (200.5, 1400.5)]
+    GOLDEN_ACQUIRED, GOLDEN_FOVS, GOLDEN_CAPTURED, GOLDEN_EXTRA = 165, 164, 313, 148
 
     print("gating")
     n1, n2 = bx(0, 0, 10, 10), bx(100, 0, 10, 10)
@@ -964,6 +974,7 @@ def run_tests():
     check("per-area uniform is not biased by dense clumps", clump_frac < 0.15, True)
     g7 = [(t["cx"], t["cy"]) for t in select_and_place(field, 100, 0.0, 0.0, 5, 7)[1]]
     print("    tiles(seed 7) = %s" % g7)
+    check("requested sample is a hard maximum", len(g7), 5)
     check("reproducible", g7, [(t["cx"], t["cy"]) for t in select_and_place(field, 100, 0.0, 0.0, 5, 7)[1]])
     check("portable golden (seed 7)", g7, GOLDEN_TILES)
 

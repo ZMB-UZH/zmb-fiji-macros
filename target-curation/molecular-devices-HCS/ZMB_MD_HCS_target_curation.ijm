@@ -1,10 +1,11 @@
 // @File(label = "Analysis results folder", style = "directory") resultsDir
 // @Integer(label = "Targets per site", value = 5, min = 1) targetsPerSite
 // @Double(label = "Minimum distance between objects in the overview image (pixels, 0 = no constraint)", value = 340, min = 0) minDistPx
+// @String(label = "Target name (leave empty to pick from a list of the targets found)", value = "", required = false) targetName
 
 // ------------------------------------------------------------------------------
-// Fiji: MD HCS target curation (v1.8.0)
-// Created: 2026-04-28 | Updated: 2026-04-29
+// Fiji: MD HCS target curation (v1.9.0)
+// Created: 2026-04-28 | Updated: 2026-07-17
 // Author: thom.dehoog@zmb.uzh.ch | ZMB Center for Microscopy and Image Analysis, UZH
 //
 // If you publish a paper using this macro, please acknowledge.
@@ -29,10 +30,22 @@
 //   - At the end, a summary dialog reports settings used and any sites that
 //     ended up under target (with reason: low_cells or constrained).
 //
+// Target selection:
+//   - IN Carta writes one CSV per target per site, named
+//     "<target>_singleTargetData_<site>.csv". The target name is the text before
+//     the first underscore, so the set of targets in an analysis is discovered by
+//     scanning the filenames; nothing about them is hardcoded here.
+//   - The operator picks one target from that discovered list. Only that target's
+//     CSVs are curated, and only they are written to TargetData/. The other
+//     targets stay in TargetData_original/ and are left out of TargetData/.
+//   - Headless runs pass the name via the targetName parameter instead; it is
+//     validated against the discovered list, so a typo fails loudly rather than
+//     silently curating nothing.
+//
 // Expected input:
 //   <resultsDir>/
 //     TargetData/                                 (IN Carta output; renamed on first run)
-//       *.csv                                     (all CSVs in this folder are considered)
+//       <target>_singleTargetData_<site>.csv      (one target is selected; the rest are ignored)
 //
 // Output:
 //   <resultsDir>/
@@ -74,6 +87,46 @@
 // ------------------------------------------------------------------------------
 
 // --- Helpers ---
+
+// The target an IN Carta CSV belongs to, taken as the text before the first
+// underscore of "<target>_singleTargetData_<site>.csv". A target whose own name
+// contains an underscore would be truncated here, and two such targets sharing a
+// first segment would collapse into one entry; IN Carta target names are free
+// text, so that is a naming convention this macro relies on rather than enforces.
+function targetOfFile(name) {
+    base = name;
+    if (endsWith(base, ".csv")) base = substring(base, 0, lengthOf(base) - 4);
+    p = indexOf(base, "_");
+    if (p < 0) return base;
+    return substring(base, 0, p);
+}
+
+// The distinct target names present in a folder of IN Carta CSVs, in the order
+// they are first met after sorting, so the list an operator sees is stable.
+function distinctTargets(dir) {
+    list = getFileList(dir);
+    Array.sort(list);
+    out = newArray(0);
+    for (ii = 0; ii < list.length; ii++) {
+        if (!endsWith(list[ii], ".csv")) continue;
+        t = targetOfFile(list[ii]);
+        known = false;
+        for (jj = 0; jj < out.length; jj++)
+            if (out[jj] == t) known = true;
+        if (!known) out = Array.concat(out, t);
+    }
+    return out;
+}
+
+// Join an array into a readable list for error messages.
+function joinList(arr) {
+    s = "";
+    for (ii = 0; ii < arr.length; ii++) {
+        if (ii > 0) s = s + ", ";
+        s = s + arr[ii];
+    }
+    return s;
+}
 
 // Find a column index by exact header name; returns -1 if absent.
 function findColumn(headerCols, name) {
@@ -192,6 +245,34 @@ origDir = resultsDir + "TargetData_original" + File.separator;
 curDir  = resultsDir + "TargetData" + File.separator;
 auditDir = resultsDir + "TargetData_curated" + File.separator;
 
+// --- Select the target to curate ---
+// The source CSVs live in TargetData_original/ once the first run has renamed
+// them, and in TargetData/ before that. Scanning and asking happen before any
+// rename or delete, so cancelling the dialog leaves the folder as it was found.
+if (File.isDirectory(origDir)) scanDir = origDir;
+else scanDir = curDir;
+if (!File.isDirectory(scanDir))
+    exit("No TargetData/ folder at: " + curDir);
+
+targets = distinctTargets(scanDir);
+if (targets.length == 0)
+    exit("No CSVs to curate in: " + scanDir);
+
+if (lengthOf(targetName) == 0) {
+    Dialog.create("MD HCS target curation");
+    Dialog.addChoice("Target to curate", targets, targets[0]);
+    Dialog.show();
+    targetName = Dialog.getChoice();
+} else {
+    known = false;
+    for (i = 0; i < targets.length; i++)
+        if (targets[i] == targetName) known = true;
+    if (!known)
+        exit("Target '" + targetName + "' is not present in:\n" + scanDir +
+             "\n \nTargets found: " + joinList(targets));
+}
+print("Curating target: " + targetName + "   (targets present: " + joinList(targets) + ")");
+
 // First run: rename IN Carta's TargetData/ -> TargetData_original/.
 if (!File.isDirectory(origDir)) {
     if (!File.isDirectory(curDir))
@@ -246,6 +327,10 @@ changeRows = newArray(0);  // tab-separated rows for TargetData_curated/curation
 for (f = 0; f < list.length; f++) {
     name = list[f];
     if (!endsWith(name, ".csv")) continue;
+    // Another target's CSV: not an error, simply not what was selected. It stays
+    // in TargetData_original/ and is deliberately absent from TargetData/.
+    fileTarget = targetOfFile(name);
+    if (fileTarget != targetName) continue;
 
     raw = File.openAsString(origDir + name);
     lines = split(raw, "\n");
@@ -367,6 +452,8 @@ runDate = d2s(year, 0) + "-" + pad2(month + 1) + "-" + pad2(dayOfMonth) + " " +
     pad2(hour) + ":" + pad2(minute) + ":" + pad2(second);
 changes = "ZMB MD HCS target curation changes\r\n";
 changes += "Run\t" + runDate + "\r\n";
+changes += "Curated target\t" + targetName + "\r\n";
+changes += "Targets present\t" + joinList(targets) + "\r\n";
 changes += "Targets per site\t" + targetsPerSite + "\r\n";
 changes += "Minimum distance overview px\t" + minDistPx + "\r\n";
 changes += "Seed\t" + seed + "\r\n";
@@ -380,6 +467,7 @@ File.saveString(changes, auditDir + "curation_changes.csv");
 
 // --- Summary in Log window ---
 print("");
+print("Curated target:  " + targetName);
 print("Sites processed: " + nFiles);
 print("Files skipped:   " + skippedList.length);
 print("Rows rejected:   " + totalRejectedRows);
@@ -390,7 +478,8 @@ print("Curated mirror:  " + auditDir);
 print("Originals:       " + origDir);
 
 // --- Summary dialog ---
-report  = "Sites processed: " + nFiles + "\n";
+report  = "Curated target:  " + targetName + "\n";
+report += "Sites processed: " + nFiles + "\n";
 report += "Files skipped:   " + skippedList.length + "\n";
 report += "Rows rejected:   " + totalRejectedRows + "\n";
 report += "Targets:         " + totalIn + " -> " + totalOut + " (N=" + targetsPerSite + " per site)\n";
