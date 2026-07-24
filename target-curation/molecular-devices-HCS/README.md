@@ -1,5 +1,9 @@
 # MD HCS target curation
 
+Current v2 investigation, validation evidence, and the unresolved cross-field
+deduplication design are documented in
+[PROGRESS_HANDOFF_2026-07-24.md](PROGRESS_HANDOFF_2026-07-24.md).
+
 When you run an IN Carta analysis on a Molecular Devices ImageXpress (MD HCS) overview, it can detect dozens of cells per well — usually more than you actually want to re-image at high magnification. This macro thins each site's list down to **N cells per site** (default 5), picked at random, and skips any cell whose re-imaging tile would overlap one that has already been picked. The original IN Carta output is preserved, so you can re-run the macro as often as you like.
 
 ## What it does

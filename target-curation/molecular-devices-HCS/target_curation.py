@@ -139,18 +139,29 @@ def build_overview_layout(wells):
     for facet, physical_wells in facets.items():
         rows = sorted(set(k[0] for k in physical_wells))
         cols = sorted(set(k[1] for k in physical_wells))
+        canonical = dict((key[2], key)
+                         for keys in physical_wells.values() for key in keys)
+        field_slots, subrows, subcols = _field_grid(canonical.values())
+        field_slots = dict((key[2], slot) for key, slot in field_slots.items())
         laid_out = {}
         for (row, col), keys in physical_wells.items():
-            slots, subrows, subcols = _field_grid(keys)
             for key in keys:
                 laid_out["R%d-C%d-F%d-Z%d-T%d" % key] = {
                     "row": row, "col": col,
                     "well_row": rows.index(row), "well_col": cols.index(col),
-                    "field_row": slots[key][0], "field_col": slots[key][1],
+                    "field_row": field_slots[key[2]][0],
+                    "field_col": field_slots[key[2]][1],
                     "field_rows": subrows, "field_cols": subcols,
                 }
         result[facet] = laid_out
     return result
+
+
+def dataset_extent(wells):
+    """Shared coordinate extent so every report panel uses the same visual scale."""
+    boxes_ = [box for well in wells for box in well["base"]]
+    return (max([b[0] + b[2] for b in boxes_] or [1.0]),
+            max([b[1] + b[3] for b in boxes_] or [1.0]))
 
 
 def _has_csv(d):
@@ -315,6 +326,12 @@ def overview_scale(description):
     return mag, changer, binning, int(region.group(1)) if region else 2304
 
 
+def overview_pixel_size(description):
+    """Overview pixel size in micrometres, read from the same image metadata."""
+    m = re.search(r'"spatial-calibration-x"[^>]*value="([^"]*)"', description)
+    return float(m.group(1)) if m else None
+
+
 def fov_px_for(target_mag, target_changer, mag_ov, changer_ov, binning_ov, region_px):
     """FOV footprint in overview-montage pixels for a target objective. The camera
     reads `region_px` pixels at any magnification; its montage footprint is that
@@ -363,6 +380,50 @@ def overview_from_results(results_dir):
     Empty string if the referenced image cannot be found."""
     path = _overview_tiff_path(results_dir)
     return read_image_description(path) if path else ""
+
+
+def _acquisition_metadata_path(results_dir):
+    """Nearest ancestor's field metadata, which defines physical site origins."""
+    d = os.path.dirname(os.path.normpath(find_target_dir(results_dir)))
+    for _ in range(6):
+        path = os.path.join(d, "image_metadata_1.csv")
+        if os.path.isfile(path):
+            return path
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return None
+
+
+def field_origins(rows, pixel_um):
+    """Map (row, col, field, z, time) to a well-local field origin in pixels."""
+    centres = {}
+    for row in rows:
+        try:
+            key = (int(row["Row"]), int(row["Column"]), int(row["Field"]),
+                   int(row["ZIndex"]), int(row["Timepoint"]))
+            centres.setdefault(key, (float(row["PositionXUm"]), float(row["PositionYUm"])))
+        except (KeyError, ValueError):
+            pass
+    groups = {}
+    for key, centre in centres.items():
+        groups.setdefault((key[0], key[1], key[3], key[4]), []).append(centre)
+    origins = {}
+    for key, (x, y) in centres.items():
+        group = groups[(key[0], key[1], key[3], key[4])]
+        origins[key] = ((x - min(p[0] for p in group)) / pixel_um,
+                        (y - min(p[1] for p in group)) / pixel_um)
+    return origins
+
+
+def read_field_origins(results_dir, pixel_um=None):
+    """Physical field origins for rendering, or an empty mapping if unavailable."""
+    path = _acquisition_metadata_path(results_dir)
+    pixel_um = pixel_um or overview_pixel_size(overview_from_results(results_dir))
+    if not path or not pixel_um:
+        return {}
+    return field_origins(read_csv(path)[1], pixel_um)
 
 
 # --------------------------------------------------------------------------- #
@@ -625,7 +686,7 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
     The first run renames IN Carta's `TargetData/` to `TargetData_original/` and never
     touches it again; every run reads from there and rewrites `TargetData/` from scratch
     with the curated per-site CSVs (the generated FOV-centre rows, one file per site,
-    named like the base target's original file). The same files are mirrored into
+    using the highest-T channel required by MetaXpress). The same files are mirrored into
     `TargetData_curated/`, with a `curation_changes.csv` audit log. A rerun is refused
     unless `TargetData/` still matches the previous mirror, so regenerated IN Carta
     output is not clobbered. `run_note` is the timestamp string for the log (the caller
@@ -653,11 +714,12 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
 
     res = curate(orig_dir, gate_spec, fov_px=fov_px, sample_size=sample_size, seed=seed,
                  neighbourhood=neighbourhood, stage_margin=stage_margin, base=base, progress=progress)
-    base, header = res["base"], res["header"]
+    base, output, header = res["base"], res["output"], res["header"]
 
     changes = [u"ZMB MD HCS target curation changes",
                u"Run\t" + run_note,
-               u"Curated target\t" + base,
+               u"Selected object\t" + base,
+               u"Acquisition CSV template\t" + output,
                u"Gate\t" + gate_spec,
                u"Cells per site/field\t%d" % sample_size,
                u"Neighbourhood (%% of radius)\t%g" % (neighbourhood * 100.0),
@@ -670,7 +732,7 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
                u"",
                u"file\tpositives\teligible\tacquired\textra\tfovs\tstatus"]
     for well in res["wells"]:
-        fname = base + _SITE_KEY + well["site"] + ".csv"
+        fname = output + _SITE_KEY + well["site"] + ".csv"
         _write_csv(cur_dir + fname, header, well["fov_rows"])
         _write_csv(audit_dir + fname, header, well["fov_rows"])
         changes.append(u"%s\t%d\t%d\t%d\t%d\t%d\t%s" % (
@@ -686,8 +748,9 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
 # --------------------------------------------------------------------------- #
 def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
            neighbourhood=2.0, stage_margin=0.05, out_csv=None, base=None, progress=None):
-    """Curate every site/field (gate -> SURS -> disjoint FOVs). `base` is the object class to
-    gate & acquire (default: the first channel). The SURS grid spans the whole scanned
+    """Curate every site/field (gate -> SURS -> disjoint FOVs). `base` is the object
+    class to gate (default: the first channel). Acquisition rows use the highest-T
+    channel's schema, independently of the selected object. The SURS grid spans the whole scanned
     area (all base objects), so the sample is spread over the site the overview imaged,
     not just where the positives landed. The per-site seed is `seed + well_index`, so
     sites are reproducible yet decorrelated (SplitMix64 makes consecutive seeds
@@ -697,6 +760,8 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
     name_index, order = discover_signals(target_dir)
     base = base if base in name_index else order[0]
     base_t = name_index[base]
+    output = max(order, key=lambda name: (name_index[name], name))
+    output_t = name_index[output]
     require = parse_gate(gate_spec)
     unknown = [s for s in require if s not in name_index]
     if unknown:
@@ -715,10 +780,14 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
         files = files_by_site[site]
         if base not in files:
             continue
+        if output not in files:
+            raise ValueError("Highest-T acquisition channel %s is missing for site %s" %
+                             (output, site))
 
         head, base_rows = read_csv(os.path.join(target_dir, files[base]))
-        header = header or head
         base_boxes = boxes(base_rows, base_t)
+        output_head, output_rows = read_csv(os.path.join(target_dir, files[output]))
+        header = header or output_head
 
         gate_boxes = {}
         for sig in require:
@@ -738,8 +807,8 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
                           if any(_fully_inside(b, t["cx"], t["cy"], half) for t in tiles)]
         extra_boxes = [b for b in captured_boxes if b not in acquired]   # captured but not sampled
 
-        template = base_rows[0] if base_rows else {}
-        well_fov_rows = [fov_row(template, base_t, t["cx"], t["cy"],
+        template = output_rows[0] if output_rows else {}
+        well_fov_rows = [fov_row(template, output_t, t["cx"], t["cy"],
                                  "FOV_%d" % (len(fov_rows) + i + 1))
                          for i, t in enumerate(tiles)]
         fov_rows.extend(well_fov_rows)
@@ -753,7 +822,7 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
 
     if out_csv and header:
         _write_csv(out_csv, header, fov_rows)
-    return {"target_dir": target_dir, "base": base, "signals": order,
+    return {"target_dir": target_dir, "base": base, "output": output, "signals": order,
             "wells": wells, "fov_rows": fov_rows, "header": header}
 
 
@@ -769,12 +838,12 @@ def _render_report(res, report_dir, fov_px):
     from ij.process import ColorProcessor
     from java.awt import Color
     canvas = 1040
+    max_x, max_y = dataset_extent(res["wells"])
+    scale = min(canvas / max_x, canvas / max_y)
     grey, orange, green, red, blue = (Color(225, 225, 225), Color(244, 165, 130),
                                       Color(26, 152, 80), Color(202, 0, 32), Color(5, 113, 176))
 
     def render(well):
-        coords = [c for b in well["base"] for c in (b[0] + b[2], b[1] + b[3])]
-        scale = canvas / (max(coords) if coords else 1.0)
         ip = ColorProcessor(canvas, canvas)
         ip.setColor(Color.WHITE); ip.fill()
 
@@ -804,14 +873,8 @@ def _render_report(res, report_dir, fov_px):
     IJ.showProgress(1.0)
 
 
-def _render_plate_overview(res, path, fov_px):
-    """Whole-plate montage with collision-free field subpanels and Z/T facets.
-
-    Physical wells retain their plate row/column position. Acquisition fields are
-    nested inside each well in a deterministic labelled grid. Different Z/time
-    combinations are saved separately.
-    Fiji-only (ImageJ ColorProcessor).
-    """
+def _render_plate_overview(res, path, fov_px, overview_desc=""):
+    """Whole-plate montage in physical well coordinates, with separate Z/T facets."""
     from ij import IJ, ImagePlus
     from ij.process import ColorProcessor
     from java.awt import Color, Font
@@ -827,6 +890,8 @@ def _render_plate_overview(res, path, fov_px):
     grey, orange, green, red, blue = (Color(210, 210, 210), Color(244, 165, 130),
                                       Color(26, 152, 80), Color(202, 0, 32), Color(5, 113, 176))
     by_site = dict((w["site"], w) for w in res["wells"])
+    max_x, max_y = dataset_extent(res["wells"])
+    origins = read_field_origins(res["target_dir"], overview_pixel_size(overview_desc))
     saved = []
 
     for facet in sorted(layout):
@@ -835,62 +900,72 @@ def _render_plate_overview(res, path, fov_px):
         n_well_cols = max(v["well_col"] for v in slots.values()) + 1
         ip = ColorProcessor(n_well_cols * panel, n_well_rows * panel)
         ip.setColor(Color.WHITE); ip.fill()
-        ip.setFont(Font("SansSerif", Font.PLAIN, 12))
 
         # Draw each physical well frame and header once.
         physical = {}
         for site, slot in slots.items():
             physical.setdefault((slot["well_row"], slot["well_col"]), slot)
-        for slot in physical.values():
-            ox, oy = slot["well_col"] * panel, slot["well_row"] * panel
-            ip.setColor(Color(150, 150, 150)); ip.drawRect(ox, oy, panel - 1, panel - 1)
-            ip.setColor(Color.BLACK)
-            ip.drawString("Row %d Col %d" % (slot["row"], slot["col"]), ox + 5, oy + 14)
+        processors = {}
+        for panel_key, slot in physical.items():
+            wp = ColorProcessor(panel, panel)
+            wp.setColor(Color.WHITE); wp.fill()
+            wp.setFont(Font("SansSerif", Font.PLAIN, 12))
+            wp.setColor(Color(150, 150, 150)); wp.drawRect(0, 0, panel - 1, panel - 1)
+            wp.setColor(Color.BLACK)
+            wp.drawString("Row %d Col %d" % (slot["row"], slot["col"]), 5, 14)
+            processors[panel_key] = wp
+
+        # Use measured stage offsets when available. The deterministic fallback keeps
+        # reports usable for exported datasets that no longer have acquisition metadata.
+        site_origins = {}
+        for site, slot in slots.items():
+            key = parse_site(site)
+            measured = origins.get(key)
+            if measured is None:
+                measured = (slot["field_col"] * max_x, slot["field_row"] * max_y)
+            site_origins[site] = measured
+        extent_x = max(site_origins[s][0] + max_x for s in slots)
+        extent_y = max(site_origins[s][1] + max_y for s in slots)
+        scale = min((panel - 8.0) / extent_x, (panel - well_top - 4.0) / extent_y)
+
+        # Draw source-field footprints first. Overlap is intentional and represents
+        # the actual acquisition geometry within the well.
+        for site, slot in slots.items():
+            key = parse_site(site)
+            wp = processors[(slot["well_row"], slot["well_col"])]
+            fx = 4 + int(site_origins[site][0] * scale)
+            fy = well_top + int(site_origins[site][1] * scale)
+            wp.setColor(Color(190, 190, 190))
+            wp.drawRect(fx, fy, int(max_x * scale), int(max_y * scale))
+            wp.setColor(Color.BLACK)
+            wp.setFont(Font("SansSerif", Font.PLAIN, 9))
+            wp.drawString("F%d" % key[2], fx + 3, fy + 10)
 
         for site, slot in slots.items():
             w = by_site[site]
-            key = parse_site(site)
-            subcols, subrows = slot["field_cols"], slot["field_rows"]
-            sub_w = panel // subcols
-            sub_h = (panel - well_top) // subrows
-            sx = slot["well_col"] * panel + slot["field_col"] * sub_w
-            sy = slot["well_row"] * panel + well_top + slot["field_row"] * sub_h
-
-            # Render into a separate processor so large FOV boxes are clipped to
-            # their own field and can never spill into a neighbouring subpanel.
-            fp = ColorProcessor(sub_w, sub_h)
-            fp.setColor(Color.WHITE); fp.fill()
-            fp.setColor(Color(190, 190, 190)); fp.drawRect(0, 0, sub_w - 1, sub_h - 1)
-            fp.setFont(Font("SansSerif", Font.PLAIN, 10))
-            fp.setColor(Color.BLACK)
-            short_status = {"full": "full", "low_cells": "low", "constrained": "constr"}[w["status"]]
-            fp.drawString("F%d  n=%d x=%d  %s" %
-                          (key[2], len(w["acquired"]), w["extra"], short_status),
-                          4, 12)
-
-            pad, field_top = 4, 16
-            max_x = max([b[0] + b[2] for b in w["base"]] or [1.0])
-            max_y = max([b[1] + b[3] for b in w["base"]] or [1.0])
-            scale = min((sub_w - 2 * pad) / max_x,
-                        (sub_h - field_top - pad) / max_y)
+            wp = processors[(slot["well_row"], slot["well_col"])]
+            origin_x, origin_y = site_origins[site]
+            ox, oy = 4, well_top
 
             def put(bs, colour, rad):
-                fp.setColor(colour)
+                wp.setColor(colour)
                 for b in bs:
-                    x = pad + int((b[0] + b[2] / 2.0) * scale)
-                    y = field_top + int((b[1] + b[3] / 2.0) * scale)
-                    fp.fillOval(x - rad, y - rad, 2 * rad + 1, 2 * rad + 1)
+                    x = ox + int((origin_x + b[0] + b[2] / 2.0) * scale)
+                    y = oy + int((origin_y + b[1] + b[3] / 2.0) * scale)
+                    wp.fillOval(x - rad, y - rad, 2 * rad + 1, 2 * rad + 1)
 
             put(w["base"], grey, 0)
             put(w["selected"], orange, 1)
             put(w["extra_boxes"], green, 2)
             put(w["acquired"], red, 2)
-            fp.setColor(blue)
+            wp.setColor(blue)
             f = int(fov_px * scale)
             for tile in w["tiles"]:
-                fp.drawRect(pad + int(tile["cx"] * scale - f / 2.0),
-                            field_top + int(tile["cy"] * scale - f / 2.0), f, f)
-            ip.insert(fp, sx, sy)
+                wp.drawRect(ox + int((origin_x + tile["cx"]) * scale - f / 2.0),
+                            oy + int((origin_y + tile["cy"]) * scale - f / 2.0), f, f)
+
+        for (well_row, well_col), wp in processors.items():
+            ip.insert(wp, well_col * panel, well_row * panel)
 
         if len(layout) == 1:
             out_path = path
@@ -941,7 +1016,8 @@ def _run_curation(results_path, gate_spec, base, objective, overview_desc,
         os.makedirs(report_dir)
     _render_report(res, report_dir, fov_px)
     IJ.showStatus("MD HCS curation: rendering plate overview...")
-    _render_plate_overview(res, os.path.join(audit_dir, "plate_overview.png"), fov_px)
+    _render_plate_overview(res, os.path.join(audit_dir, "plate_overview.png"),
+                           fov_px, overview_desc)
     IJ.showStatus("MD HCS curation: done - see the Log")
 
     acquired = sum(len(w["acquired"]) for w in res["wells"])
@@ -971,7 +1047,7 @@ def run_macro():
     _, order = discover_signals(scan_dir)          # the classes (groups) found in the data
 
     gd = GenericDialog("MD HCS target curation")
-    gd.addMessage("Classes  -  mark ONE as the object (base to gate & acquire),")   # section 2
+    gd.addMessage("Classes  -  mark ONE as the object to gate,")                    # section 2
     gd.addMessage("the rest positive / negative / ignore:")
     for sig in order:                              # one pull-down per class, however many
         gd.addChoice(sig, ["object", "positive", "negative", "ignore"],
@@ -1069,6 +1145,26 @@ def run_tests():
     check("deterministic field grid", field_slots,
           {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)})
     check("four fields get unique slots", len(set(field_slots.values())), 4)
+    uneven = build_overview_layout(
+        layout_wells + [{"site": "R3-C3-F0-Z0-T0"}])[(0, 0)]
+    check("all wells share one field grid",
+          (uneven["R3-C3-F0-Z0-T0"]["field_rows"],
+           uneven["R3-C3-F0-Z0-T0"]["field_cols"]), (2, 2))
+    check("dataset extent spans every site",
+          dataset_extent([{"base": [(0, 0, 10, 20)]},
+                          {"base": [(100, 50, 5, 7)]}]), (105, 57))
+    metadata_rows = [
+        {"Row": "3", "Column": "2", "Field": "0", "ZIndex": "0", "Timepoint": "0",
+         "PositionXUm": "10", "PositionYUm": "20"},
+        {"Row": "3", "Column": "2", "Field": "1", "ZIndex": "0", "Timepoint": "0",
+         "PositionXUm": "10", "PositionYUm": "30"},
+        {"Row": "3", "Column": "2", "Field": "2", "ZIndex": "0", "Timepoint": "0",
+         "PositionXUm": "25", "PositionYUm": "30"}]
+    check("stage metadata becomes well-local pixel origins",
+          field_origins(metadata_rows, 0.5),
+          {(3, 2, 0, 0, 0): (0.0, 0.0),
+           (3, 2, 1, 0, 0): (0.0, 20.0),
+           (3, 2, 2, 0, 0): (30.0, 20.0)})
 
     faceted = build_overview_layout(
         [{"site": "R3-C2-F0-Z0-T0"}, {"site": "R3-C2-F0-Z1-T0"},
@@ -1196,15 +1292,19 @@ def run_tests():
         res, cur_dir, audit_dir = write_curated_output(tmp, "mScarlet cells:yes", 100.0,
                                                        sample_size=5, seed=1, run_note="t")
         n_fov = len(res["wells"][0]["tiles"])
-        curated = os.path.join(cur_dir, "DAPI_singleTargetData_%s.csv" % site)
+        curated = os.path.join(cur_dir, "mScarlet cells_singleTargetData_%s.csv" % site)
         check("first run preserves originals", os.path.isdir(os.path.join(tmp, "TargetData_original")), True)
         check("curated per-site file written", os.path.isfile(curated), True)
         check("mirror + changes log written", os.path.isfile(os.path.join(audit_dir, "curation_changes.csv")), True)
-        check("only the base target lands in TargetData/",
-              os.path.isfile(os.path.join(cur_dir, "mScarlet cells_singleTargetData_%s.csv" % site)), False)
+        check("highest-T target lands in TargetData/", os.path.isfile(curated), True)
+        check("lower-T base target is not emitted",
+              os.path.isfile(os.path.join(cur_dir, "DAPI_singleTargetData_%s.csv" % site)), False)
         ch, rr = read_csv(curated)
-        check("curated header == original (object_id first)", ch[0], "object_id")
+        check("curated schema is highest T", "T2$AS_FID_Blob_BoundingBoxX" in ch, True)
+        check("curated schema excludes base T", "T1$AS_FID_Blob_BoundingBoxX" in ch, False)
         check("3 positives -> 3 disjoint FOV rows", (len(rr), n_fov), (3, 3))
+        check("result records independent selection/output roles",
+              (res["base"], res["output"]), ("DAPI", "mScarlet cells"))
         check("synthetic site status", res["wells"][0]["status"], "low_cells")
         res2, _, _ = write_curated_output(tmp, "mScarlet cells:yes", 100.0, sample_size=5, seed=1, run_note="t2")
         check("rerun allowed (matches mirror) + reproduces", len(res2["wells"][0]["tiles"]), n_fov)
