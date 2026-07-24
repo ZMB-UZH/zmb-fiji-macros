@@ -4,7 +4,7 @@
 MD HCS target curation - single-file Fiji macro (Jython 2.7) and CPython module.
 
 Molecular Devices ImageXpress / IN Carta writes one CSV of segmented objects per
-signal per well. This picks, per well, a small representative set of cells to
+signal per acquisition site. This picks, per site/field, a small representative set of cells to
 re-image at high magnification, in three steps:
 
   1. GATE the objects of interest. One class is the base object (the thing gated and
@@ -32,14 +32,14 @@ run preserves IN Carta's `TargetData/` as `TargetData_original/`; every run rewr
 `TargetData/` from scratch with the curated per-site CSVs (the generated FOV-centre
 rows MetaXpress re-images) and mirrors them into `TargetData_curated/` with a
 `curation_changes.csv` audit log (positives / eligible / acquired / extra / fovs per
-site), a per-well overlay PNG under `report/`, and a whole-plate `plate_overview.png`.
+site), a per-site overlay PNG under `report/`, and whole-plate overview PNGs.
 A rerun refuses to overwrite `TargetData/` unless it still matches the last curated
 mirror, so newly regenerated IN Carta output is never clobbered. `acquired` = sampled target cells (imaged whole);
 `extra` = bonus positives that also fall entirely inside a field.
 
 In Fiji you point at the InCarta results folder, then a dialog assembles the run in
 sections: one dropdown per marker class found in the data to set positives (positive /
-negative / ignore); the target objective; and the parameters (cells per well,
+negative / ignore); the target objective; and the parameters (cells per site/field,
 neighbourhood as % of the cell radius, stage margin, seed). The FOV size is inferred
 from the overview image's own metadata (objective, changer, binning, sensor region);
 the overview image is located automatically from the InCarta result metadata
@@ -56,8 +56,8 @@ differ between CPython 3 and Jython 2.7), so results are byte-identical in both.
 
 The code below reads top-to-bottom as the pipeline flows: import the data (1) ->
 gate it (2) -> work out the FOV size (3) and what fits in a FOV (4) -> draw random
-numbers (5) -> sample (6) -> place fields (7) -> combine per well (8) -> write the
-output (9) -> curate every well (10) -> the Fiji front end (11), tests (12), dispatch.
+numbers (5) -> sample (6) -> place fields (7) -> combine per site (8) -> write the
+output (9) -> curate every site (10) -> the Fiji front end (11), tests (12), dispatch.
 """
 from __future__ import division, print_function
 import io, os, re
@@ -65,6 +65,7 @@ import io, os, re
 _BB = "AS_FID_Blob_BoundingBox"          # + X / Y / Width / Height
 _OWN = re.compile(r"^T(\d+)\$")          # a signal's own-measurement column prefix
 _SITE_KEY = "_singleTargetData_"         # filename split: <signal>_singleTargetData_<site>.csv
+_SITE_RE = re.compile(r"^R(\d+)-C(\d+)-F(\d+)-Z(\d+)-T(\d+)$")
 _MASK64 = (1 << 64) - 1
 
 
@@ -91,6 +92,65 @@ def _site_of(fn):
     """The well/site token a CSV belongs to: the text after `_singleTargetData_`."""
     stem = fn[:-4]
     return stem.split(_SITE_KEY, 1)[1] if _SITE_KEY in stem else stem
+
+
+def parse_site(site):
+    """Parse `R#-C#-F#-Z#-T#` into integer row/column/field/z/time values.
+
+    Rendering must never silently collapse an unrecognised identifier onto another
+    panel, so malformed site tokens fail loudly instead of being partially parsed.
+    """
+    m = _SITE_RE.match(site)
+    if not m:
+        raise ValueError("Malformed site identifier: " + site)
+    return tuple(int(v) for v in m.groups())
+
+
+def site_status(eligible_count, acquired_count, requested_count):
+    """Classify why a site did or did not reach the requested acquisition count."""
+    if acquired_count >= requested_count:
+        return "full"
+    if eligible_count < requested_count:
+        return "low_cells"
+    return "constrained"
+
+
+def _field_grid(site_keys):
+    """Map fields to a deterministic, collision-free near-square report grid."""
+    keys = sorted(site_keys, key=lambda k: k[2])
+    ncols = max(1, int(len(keys) ** 0.5 + 0.999999))
+    nrows = max(1, (len(keys) + ncols - 1) // ncols)
+    slots = dict((k, (i // ncols, i % ncols)) for i, k in enumerate(keys))
+    return slots, nrows, ncols
+
+
+def build_overview_layout(wells):
+    """Pure layout model used by the Fiji renderer and CPython regression tests.
+
+    Returns {(z, time): {site: layout}}, where layout contains the physical plate
+    row/column and a unique field subpanel slot. Z/time variants are separate facets.
+    """
+    facets = {}
+    for well in wells:
+        key = parse_site(well["site"])
+        facets.setdefault((key[3], key[4]), {}).setdefault((key[0], key[1]), []).append(key)
+
+    result = {}
+    for facet, physical_wells in facets.items():
+        rows = sorted(set(k[0] for k in physical_wells))
+        cols = sorted(set(k[1] for k in physical_wells))
+        laid_out = {}
+        for (row, col), keys in physical_wells.items():
+            slots, subrows, subcols = _field_grid(keys)
+            for key in keys:
+                laid_out["R%d-C%d-F%d-Z%d-T%d" % key] = {
+                    "row": row, "col": col,
+                    "well_row": rows.index(row), "well_col": cols.index(col),
+                    "field_row": slots[key][0], "field_col": slots[key][1],
+                    "field_rows": subrows, "field_cols": subcols,
+                }
+        result[facet] = laid_out
+    return result
 
 
 def _has_csv(d):
@@ -599,7 +659,7 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
                u"Run\t" + run_note,
                u"Curated target\t" + base,
                u"Gate\t" + gate_spec,
-               u"Cells per well\t%d" % sample_size,
+               u"Cells per site/field\t%d" % sample_size,
                u"Neighbourhood (%% of radius)\t%g" % (neighbourhood * 100.0),
                u"Stage margin (%% per side)\t%g" % (stage_margin * 100.0),
                u"Seed\t%d" % seed,
@@ -608,30 +668,30 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
                u"Operational TargetData\t" + cur_dir,
                u"Curated mirror\t" + audit_dir,
                u"",
-               u"file\tpositives\teligible\tacquired\textra\tfovs\tsample_short"]
+               u"file\tpositives\teligible\tacquired\textra\tfovs\tstatus"]
     for well in res["wells"]:
         fname = base + _SITE_KEY + well["site"] + ".csv"
         _write_csv(cur_dir + fname, header, well["fov_rows"])
         _write_csv(audit_dir + fname, header, well["fov_rows"])
         changes.append(u"%s\t%d\t%d\t%d\t%d\t%d\t%s" % (
             fname, len(well["selected"]), well["eligible"], len(well["acquired"]),
-            well["extra"], len(well["tiles"]), well["sample_short"]))
+            well["extra"], len(well["tiles"]), well["status"]))
     with io.open(audit_dir + "curation_changes.csv", "w", encoding="utf-8", newline="") as fh:
         fh.write(u"\r\n".join(changes) + u"\r\n")
     return res, cur_dir, audit_dir
 
 
 # --------------------------------------------------------------------------- #
-# 10. Curate - run the whole pipeline over every well                         #
+# 10. Curate - run the whole pipeline over every acquisition site/field       #
 # --------------------------------------------------------------------------- #
 def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
            neighbourhood=2.0, stage_margin=0.05, out_csv=None, base=None, progress=None):
-    """Curate every well (gate -> SURS -> disjoint FOVs). `base` is the object class to
+    """Curate every site/field (gate -> SURS -> disjoint FOVs). `base` is the object class to
     gate & acquire (default: the first channel). The SURS grid spans the whole scanned
-    area (all base objects), so the sample is spread over the well the overview imaged,
-    not just where the positives landed. The per-well seed is `seed + well_index`, so
-    wells are reproducible yet decorrelated (SplitMix64 makes consecutive seeds
-    independent). Returns a dict with per-well results and generated FOV rows; writes
+    area (all base objects), so the sample is spread over the site the overview imaged,
+    not just where the positives landed. The per-site seed is `seed + well_index`, so
+    sites are reproducible yet decorrelated (SplitMix64 makes consecutive seeds
+    independent). Returns a dict with per-site results and generated FOV rows; writes
     the curated CSV if out_csv is given."""
     target_dir = find_target_dir(results_dir)
     name_index, order = discover_signals(target_dir)
@@ -683,10 +743,12 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
                                  "FOV_%d" % (len(fov_rows) + i + 1))
                          for i, t in enumerate(tiles)]
         fov_rows.extend(well_fov_rows)
+        status = site_status(n_eligible, len(acquired), sample_size)
         wells.append({"site": site, "base": base_boxes, "selected": selected,
                       "acquired": acquired, "captured": len(captured_boxes),
                       "extra": len(extra_boxes), "extra_boxes": extra_boxes,
-                      "eligible": n_eligible, "sample_short": n_eligible < sample_size,
+                      "eligible": n_eligible, "status": status,
+                      "sample_short": status != "full",
                       "tiles": tiles, "fov_rows": well_fov_rows})
 
     if out_csv and header:
@@ -701,7 +763,7 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
 # plain CPython (for the tests).                                               #
 # --------------------------------------------------------------------------- #
 def _render_report(res, report_dir, fov_px):
-    """One overlay PNG per well (grey nuclei / orange positives / red sampled / blue
+    """One overlay PNG per site (grey nuclei / orange positives / red sampled / blue
     FOV boxes) written under the curated mirror. Fiji-only (ImageJ ColorProcessor)."""
     from ij import IJ, ImagePlus
     from ij.process import ColorProcessor
@@ -743,53 +805,101 @@ def _render_report(res, report_dir, fov_px):
 
 
 def _render_plate_overview(res, path, fov_px):
-    """One montage of the whole plate: a panel per well (laid out by plate row/column)
-    with grey nuclei / orange positives / green extras / red sampled / blue FOV boxes,
-    for a bird's-eye check of the curation. Fiji-only (ImageJ ColorProcessor)."""
+    """Whole-plate montage with collision-free field subpanels and Z/T facets.
+
+    Physical wells retain their plate row/column position. Acquisition fields are
+    nested inside each well in a deterministic labelled grid. Different Z/time
+    combinations are saved separately.
+    Fiji-only (ImageJ ColorProcessor).
+    """
     from ij import IJ, ImagePlus
     from ij.process import ColorProcessor
     from java.awt import Color, Font
 
-    def rc(site):
-        r, c = site.split("-")[0], site.split("-")[1]
-        return int(r[1:]), int(c[1:])
-
-    rows = sorted(set(rc(w["site"])[0] for w in res["wells"]))
-    cols = sorted(set(rc(w["site"])[1] for w in res["wells"]))
-    if not rows or not cols:
+    if not res["wells"]:
         return
-    panel, pad, top = 300, 6, 22
-    ip = ColorProcessor(len(cols) * panel, len(rows) * panel)
-    ip.setColor(Color.WHITE); ip.fill()
-    ip.setFont(Font("SansSerif", Font.PLAIN, 13))
+
+    layout = build_overview_layout(res["wells"])
+    if not layout:
+        return
+
+    panel, well_top = 300, 19
     grey, orange, green, red, blue = (Color(210, 210, 210), Color(244, 165, 130),
                                       Color(26, 152, 80), Color(202, 0, 32), Color(5, 113, 176))
-    for w in res["wells"]:
-        r, c = rc(w["site"])
-        ox, oy = cols.index(c) * panel, rows.index(r) * panel
-        ip.setColor(Color(170, 170, 170)); ip.drawRect(ox, oy, panel - 1, panel - 1)
-        ip.setColor(Color.BLACK)
-        ip.drawString("Row %d Col %d   sampled=%d extra=%d" % (r, c, len(w["acquired"]), w["extra"]),
-                      ox + pad, oy + top - 5)
-        coords = [cc for b in w["base"] for cc in (b[0] + b[2], b[1] + b[3])]
-        scale = (panel - 2 * pad - top) / (max(coords) if coords else 1.0)
+    by_site = dict((w["site"], w) for w in res["wells"])
+    saved = []
 
-        def put(bs, colour, rad):
-            ip.setColor(colour)
-            for b in bs:
-                x = ox + pad + int((b[0] + b[2] / 2.0) * scale)
-                y = oy + top + int((b[1] + b[3] / 2.0) * scale)
-                ip.fillOval(x - rad, y - rad, 2 * rad + 1, 2 * rad + 1)
-        put(w["base"], grey, 0)
-        put(w["selected"], orange, 1)
-        put(w["extra_boxes"], green, 2)
-        put(w["acquired"], red, 2)
-        ip.setColor(blue)
-        f = int(fov_px * scale)
-        for t in w["tiles"]:
-            ip.drawRect(ox + pad + int(t["cx"] * scale - f / 2.0),
-                        oy + top + int(t["cy"] * scale - f / 2.0), f, f)
-    IJ.saveAs(ImagePlus("plate", ip), "PNG", path)
+    for facet in sorted(layout):
+        slots = layout[facet]
+        n_well_rows = max(v["well_row"] for v in slots.values()) + 1
+        n_well_cols = max(v["well_col"] for v in slots.values()) + 1
+        ip = ColorProcessor(n_well_cols * panel, n_well_rows * panel)
+        ip.setColor(Color.WHITE); ip.fill()
+        ip.setFont(Font("SansSerif", Font.PLAIN, 12))
+
+        # Draw each physical well frame and header once.
+        physical = {}
+        for site, slot in slots.items():
+            physical.setdefault((slot["well_row"], slot["well_col"]), slot)
+        for slot in physical.values():
+            ox, oy = slot["well_col"] * panel, slot["well_row"] * panel
+            ip.setColor(Color(150, 150, 150)); ip.drawRect(ox, oy, panel - 1, panel - 1)
+            ip.setColor(Color.BLACK)
+            ip.drawString("Row %d Col %d" % (slot["row"], slot["col"]), ox + 5, oy + 14)
+
+        for site, slot in slots.items():
+            w = by_site[site]
+            key = parse_site(site)
+            subcols, subrows = slot["field_cols"], slot["field_rows"]
+            sub_w = panel // subcols
+            sub_h = (panel - well_top) // subrows
+            sx = slot["well_col"] * panel + slot["field_col"] * sub_w
+            sy = slot["well_row"] * panel + well_top + slot["field_row"] * sub_h
+
+            # Render into a separate processor so large FOV boxes are clipped to
+            # their own field and can never spill into a neighbouring subpanel.
+            fp = ColorProcessor(sub_w, sub_h)
+            fp.setColor(Color.WHITE); fp.fill()
+            fp.setColor(Color(190, 190, 190)); fp.drawRect(0, 0, sub_w - 1, sub_h - 1)
+            fp.setFont(Font("SansSerif", Font.PLAIN, 10))
+            fp.setColor(Color.BLACK)
+            short_status = {"full": "full", "low_cells": "low", "constrained": "constr"}[w["status"]]
+            fp.drawString("F%d  n=%d x=%d  %s" %
+                          (key[2], len(w["acquired"]), w["extra"], short_status),
+                          4, 12)
+
+            pad, field_top = 4, 16
+            max_x = max([b[0] + b[2] for b in w["base"]] or [1.0])
+            max_y = max([b[1] + b[3] for b in w["base"]] or [1.0])
+            scale = min((sub_w - 2 * pad) / max_x,
+                        (sub_h - field_top - pad) / max_y)
+
+            def put(bs, colour, rad):
+                fp.setColor(colour)
+                for b in bs:
+                    x = pad + int((b[0] + b[2] / 2.0) * scale)
+                    y = field_top + int((b[1] + b[3] / 2.0) * scale)
+                    fp.fillOval(x - rad, y - rad, 2 * rad + 1, 2 * rad + 1)
+
+            put(w["base"], grey, 0)
+            put(w["selected"], orange, 1)
+            put(w["extra_boxes"], green, 2)
+            put(w["acquired"], red, 2)
+            fp.setColor(blue)
+            f = int(fov_px * scale)
+            for tile in w["tiles"]:
+                fp.drawRect(pad + int(tile["cx"] * scale - f / 2.0),
+                            field_top + int(tile["cy"] * scale - f / 2.0), f, f)
+            ip.insert(fp, sx, sy)
+
+        if len(layout) == 1:
+            out_path = path
+        else:
+            stem, ext = os.path.splitext(path)
+            out_path = "%s_Z%d_T%d%s" % (stem, facet[0], facet[1], ext or ".png")
+        IJ.saveAs(ImagePlus("plate_Z%d_T%d" % facet, ip), "PNG", out_path)
+        saved.append(out_path)
+    return saved
 
 
 def _run_curation(results_path, gate_spec, base, objective, overview_desc,
@@ -817,15 +927,15 @@ def _run_curation(results_path, gate_spec, base, objective, overview_desc,
     def tick(done, total):                             # Log heartbeat + status-bar progress
         IJ.showProgress(done, total)
         if done == total or done % 10 == 0:
-            IJ.log("  ...curated %d/%d wells" % (done, total))
+            IJ.log("  ...curated %d/%d sites" % (done, total))
 
-    IJ.log("  working - curating wells (reading CSVs, sampling, placing FOVs)...")
-    IJ.showStatus("MD HCS curation: curating wells...")
+    IJ.log("  working - curating sites (reading CSVs, sampling, placing FOVs)...")
+    IJ.showStatus("MD HCS curation: curating sites...")
     res, cur_dir, audit_dir = write_curated_output(
         results_path, gate_spec, fov_px, sample_size, seed, neighbourhood, stage_margin,
         run_note=str(Date()), base=base, progress=tick)
 
-    IJ.log("  working - rendering %d per-well reports + plate overview..." % len(res["wells"]))
+    IJ.log("  working - rendering %d per-site reports + plate overview..." % len(res["wells"]))
     report_dir = os.path.join(audit_dir, "report")
     if not os.path.isdir(report_dir):
         os.makedirs(report_dir)
@@ -837,9 +947,10 @@ def _run_curation(results_path, gate_spec, base, objective, overview_desc,
     acquired = sum(len(w["acquired"]) for w in res["wells"])
     extra = sum(w["extra"] for w in res["wells"])
     fovs = sum(len(w["tiles"]) for w in res["wells"])
-    under = sum(1 for w in res["wells"] if w["sample_short"])
-    IJ.log("  wells=%d acquired=%d extra-whole=%d FOVs=%d under-sampled=%d"
-           % (len(res["wells"]), acquired, extra, fovs, under))
+    under = sum(1 for w in res["wells"] if w["status"] != "full")
+    constrained = sum(1 for w in res["wells"] if w["status"] == "constrained")
+    IJ.log("  sites=%d acquired=%d extra-whole=%d FOVs=%d under-sampled=%d constrained=%d"
+           % (len(res["wells"]), acquired, extra, fovs, under, constrained))
     IJ.log("  curated TargetData -> %s" % cur_dir)
     IJ.log("  mirror + changes   -> %s" % audit_dir)
     return res
@@ -873,7 +984,7 @@ def run_macro():
         gd.addMessage("(Cancel and pick the original results folder, or select the image below.)")
         gd.addFileField("Overview image", "")
     gd.addMessage("Parameters")                                           # section 4
-    gd.addNumericField("Cells per well (min)", 5, 0)
+    gd.addNumericField("Cells per site/field (target)", 5, 0)
     gd.addNumericField("Neighbourhood (% of cell radius)", 200, 0)
     gd.addNumericField("Stage margin (% per side)", 5, 0)
     gd.addNumericField("Random seed", 42, 0)
@@ -938,6 +1049,31 @@ def run_tests():
           build_gate_spec(["A", "B"], {"A": "object", "B": "positive"}), "B:yes")
     check("gate builder round-trips via parse_gate",
           parse_gate(build_gate_spec(["mScarlet cells"], {"mScarlet cells": "positive"})), {"mScarlet cells": True})
+
+    print("site parsing + overview layout")
+    check("full site parsed", parse_site("R3-C2-F1-Z0-T4"), (3, 2, 1, 0, 4))
+    malformed = False
+    try:
+        parse_site("R3-C2")
+    except ValueError:
+        malformed = True
+    check("malformed site rejected", malformed, True)
+    check("status full", site_status(5, 5, 5), "full")
+    check("status low cells", site_status(4, 4, 5), "low_cells")
+    check("status constrained", site_status(6, 4, 5), "constrained")
+
+    layout_wells = [{"site": "R3-C2-F%d-Z0-T0" % f} for f in range(4)]
+    laid = build_overview_layout(layout_wells)[(0, 0)]
+    field_slots = dict((parse_site(site)[2], (v["field_row"], v["field_col"]))
+                       for site, v in laid.items())
+    check("deterministic field grid", field_slots,
+          {0: (0, 0), 1: (0, 1), 2: (1, 0), 3: (1, 1)})
+    check("four fields get unique slots", len(set(field_slots.values())), 4)
+
+    faceted = build_overview_layout(
+        [{"site": "R3-C2-F0-Z0-T0"}, {"site": "R3-C2-F0-Z1-T0"},
+         {"site": "R3-C2-F0-Z0-T1"}])
+    check("Z/T variants are separate facets", sorted(faceted), [(0, 0), (0, 1), (1, 0)])
 
     print("SURS + disjoint placement")
     check("oversized cell not eligible", eligible([bx(0, 0, 500, 500)], 100, 0.0, 0.0), [])
@@ -1069,6 +1205,7 @@ def run_tests():
         ch, rr = read_csv(curated)
         check("curated header == original (object_id first)", ch[0], "object_id")
         check("3 positives -> 3 disjoint FOV rows", (len(rr), n_fov), (3, 3))
+        check("synthetic site status", res["wells"][0]["status"], "low_cells")
         res2, _, _ = write_curated_output(tmp, "mScarlet cells:yes", 100.0, sample_size=5, seed=1, run_note="t2")
         check("rerun allowed (matches mirror) + reproduces", len(res2["wells"][0]["tiles"]), n_fov)
         rb = curate(os.path.join(tmp, "TargetData_original"), "DAPI:yes", fov_px=100.0, base="mScarlet cells")
