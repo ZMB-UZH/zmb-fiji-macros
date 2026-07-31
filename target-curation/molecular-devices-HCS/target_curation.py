@@ -1089,6 +1089,20 @@ def run_macro():
 # --------------------------------------------------------------------------- #
 # 12. Tests - `python target_curation.py` in CPython; also runs in Fiji Jython #
 # --------------------------------------------------------------------------- #
+# The acceptance datasets live on the facility share, not in the repo, so every block
+# that uses them skips when they are absent. Nico is the single-field control (one
+# stitched montage per well); Babette is the four-field case (2x2, 10% overlap). Nico
+# points at the untouched `- Copy`: the sibling folder without the suffix has already
+# been curated in place, so its TargetData/ holds generated FOV rows rather than IN
+# Carta's original objects.
+NICO_RESULTS = (r"Z:\transfer\Thom\Nico MD"
+                r"\NB26-15_Overview10x_DAPI-mScarlet_20260713_152811\experiment_montage"
+                r"\Results\mScarlet Cells_2026-Jul-13-17-23-33-077 - Copy")
+BABETTE_RESULTS = (r"Z:\transfer\Thom\Babette MD"
+                   r"\26.19 NPTX2 ASO IF test_20260722_104349\experiment"
+                   r"\Results\TriplePositive_Thom_2026-Jul-22-12-20-15-690")
+
+
 def run_tests():
     fails = []
 
@@ -1110,7 +1124,20 @@ def run_tests():
     # verified identical in CPython and Fiji Jython.
     GOLDEN_TILES = [(800.5, 400.5), (200.5, 1000.5), (1200.5, 600.5),
                     (1000.5, 1400.5), (200.5, 1400.5)]
+    # Nico plate, gate `mScarlet cells:yes`, FOV 384 px (60x target from a 10x overview),
+    # 5 cells/well, seed 42 - the parameters of the production run.
+    GOLDEN_POSITIVES, GOLDEN_ELIGIBLE = 4253, 4247
     GOLDEN_ACQUIRED, GOLDEN_FOVS, GOLDEN_CAPTURED, GOLDEN_EXTRA = 165, 164, 313, 148
+    NICO_FOV = 384.0
+
+    # Babette plate: 2x2 fields per well at 10% overlap, gate `Green:yes; Red:yes`,
+    # FOV 1536 px (60x target from a 40x overview). DEFECT_* are what the per-field
+    # pipeline produces today; pinning them makes the well-level fix show up as a
+    # deliberate flip to zero rather than an unexplained change in the numbers.
+    BABETTE_FOV = 1536.0
+    GOLDEN_BAB_WELLS = 40
+    DEFECT_BAB_ACQUIRED, DEFECT_BAB_FOVS = 212, 99
+    DEFECT_BAB_DUPLICATES, DEFECT_BAB_XFIELD_FOVS, DEFECT_BAB_OVER_TARGET = 7, 19, 17
 
     print("gating")
     n1, n2 = bx(0, 0, 10, 10), bx(100, 0, 10, 10)
@@ -1233,13 +1260,11 @@ def run_tests():
     check("40x -> 576 px", fov["40x"], 576.0)
     check("60x -> 384 px", fov["60x"], 384.0)
     check("60x + 1.5x changer -> 256 px", fov["60x + 1.5x changer"], 256.0)
-    real_ov = os.path.join(
-        r"Z:\transfer\Thom\Nico MD\NB26-15_Overview10x_DAPI-mScarlet_20260713_152811",
-        "experiment_montage", "timepoint0",
-        "NB26-15_Overview10x_DAPI-mScarlet_t0_C09_s0_w0_z0.tif")
-    if os.path.isfile(real_ov):
+    real_ov = (_overview_tiff_path(BABETTE_RESULTS)
+               if os.path.isdir(os.path.join(BABETTE_RESULTS, "TargetData")) else None)
+    if real_ov and os.path.isfile(real_ov):
         check("real overview TIFF scale read", overview_scale(read_image_description(real_ov)),
-              (10.0, 1.0, 1, 2304))
+              (40.0, 1.0, 1, 2304))
     else:
         print("  SKIP real overview TIFF (not present)")
 
@@ -1262,12 +1287,12 @@ def run_tests():
         check("overview image found by walking up from results", _overview_tiff_path(analysis), ov)
     finally:
         shutil.rmtree(ov_tmp, ignore_errors=True)
-    real_analysis = os.path.join(
-        r"Z:\transfer\Thom\Nico MD\NB26-15_Overview10x_DAPI-mScarlet_20260713_152811",
-        "experiment_montage", "Results", "mScarlet Cells_2026-Jul-13-17-23-33-077")
-    if os.path.isdir(os.path.join(real_analysis, "TargetData")):
+    if os.path.isdir(os.path.join(BABETTE_RESULTS, "TargetData")):
+        real_desc = overview_from_results(BABETTE_RESULTS)
         check("overview auto-found + scaled from real results",
-              overview_scale(overview_from_results(real_analysis)), (10.0, 1.0, 1, 2304))
+              overview_scale(real_desc), (40.0, 1.0, 1, 2304))
+        check("overview pixel size read from the same image",
+              overview_pixel_size(real_desc), 0.1621)
     else:
         print("  SKIP overview auto-discovery on real results (not present)")
 
@@ -1314,23 +1339,25 @@ def run_tests():
         shutil.rmtree(tmp, ignore_errors=True)
 
     print("real data (auto-skip)")
-    real = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Results",
-                        "mScarlet Cells_2026-Jul-13-17-23-33-077")
-    if os.path.isdir(os.path.join(real, "TargetData")):
-        res = curate(real, "mScarlet cells:yes")
+    if os.path.isdir(os.path.join(NICO_RESULTS, "TargetData")):
+        res = curate(NICO_RESULTS, "mScarlet cells:yes", fov_px=NICO_FOV)
         pos = sum(len(w["selected"]) for w in res["wells"])
+        elig_n = sum(w["eligible"] for w in res["wells"])
         acquired = sum(len(w["acquired"]) for w in res["wells"])
         captured = sum(w["captured"] for w in res["wells"])
         extra = sum(w["extra"] for w in res["wells"])
         fovs = sum(len(w["tiles"]) for w in res["wells"])
         overlaps = sum(1 for wl in res["wells"] for a in range(len(wl["tiles"]))
                        for b in range(a + 1, len(wl["tiles"]))
-                       if abs(wl["tiles"][a]["cx"] - wl["tiles"][b]["cx"]) < 256
-                       and abs(wl["tiles"][a]["cy"] - wl["tiles"][b]["cy"]) < 256)
-        print("    plate: positives=%d acquired=%d extra=%d captured=%d FOVs=%d overlaps=%d"
-              % (pos, acquired, extra, captured, fovs, overlaps))
+                       if abs(wl["tiles"][a]["cx"] - wl["tiles"][b]["cx"]) < NICO_FOV
+                       and abs(wl["tiles"][a]["cy"] - wl["tiles"][b]["cy"]) < NICO_FOV)
+        print("    plate: positives=%d eligible=%d acquired=%d extra=%d captured=%d FOVs=%d overlaps=%d"
+              % (pos, elig_n, acquired, extra, captured, fovs, overlaps))
         check("signals discovered", res["signals"], ["DAPI", "mScarlet cells"])
-        check("plate positives (golden)", pos, 4253)
+        check("plate positives (golden)", pos, GOLDEN_POSITIVES)
+        check("plate eligible (golden)", elig_n, GOLDEN_ELIGIBLE)
+        check("one field per well (the montage control)",
+              sorted(set(parse_site(w["site"])[2] for w in res["wells"])), [0])
         check("no overlapping FOVs on the plate", overlaps, 0)
         check("plate acquired (golden)", acquired, GOLDEN_ACQUIRED)
         check("captured == acquired + extra", captured, acquired + extra)
@@ -1338,6 +1365,53 @@ def run_tests():
         check("extra_boxes count matches extra", sum(len(w["extra_boxes"]) for w in res["wells"]), GOLDEN_EXTRA)
         check("plate captured (golden)", captured, GOLDEN_CAPTURED)
         check("plate FOVs (golden)", fovs, GOLDEN_FOVS)
+    else:
+        print("  SKIP (dataset not present)")
+
+    print("four overlapping fields per well (auto-skip)")
+    if os.path.isdir(os.path.join(BABETTE_RESULTS, "TargetData")):
+        res = curate(BABETTE_RESULTS, "Green:yes; Red:yes", fov_px=BABETTE_FOV)
+        origins = read_field_origins(
+            BABETTE_RESULTS, overview_pixel_size(overview_from_results(BABETTE_RESULTS)))
+
+        # Regroup the per-site results into physical wells, moving each site's cells and
+        # FOVs into well coordinates with the measured field origins. This is what the
+        # selection path cannot see today, which is why the duplicates below exist.
+        pooled, fields_per_well = {}, {}
+        for w in res["wells"]:
+            row, col, fld, z, tp = parse_site(w["site"])
+            ox, oy = origins[(row, col, fld, z, tp)]
+            fields_per_well.setdefault((row, col, z, tp), set()).add(fld)
+            cur = pooled.setdefault((row, col, z, tp), {"cells": [], "tiles": []})
+            cur["cells"] += [(b[0] + b[2] / 2.0 + ox, b[1] + b[3] / 2.0 + oy, fld)
+                             for b in w["acquired"]]
+            cur["tiles"] += [(tl["cx"] + ox, tl["cy"] + oy, fld) for tl in w["tiles"]]
+
+        def cross_field(well, key, near):
+            items = well[key]
+            return sum(1 for i, a in enumerate(items) for b in items[i + 1:]
+                       if a[2] != b[2] and near(a, b))
+
+        duplicates = sum(cross_field(w, "cells", lambda a, b:
+                                     (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 < 40.0 ** 2)
+                         for w in pooled.values())
+        xfield = sum(cross_field(w, "tiles", lambda a, b:
+                                 abs(a[0] - b[0]) < BABETTE_FOV and abs(a[1] - b[1]) < BABETTE_FOV)
+                     for w in pooled.values())
+        acquired = sum(len(w["cells"]) for w in pooled.values())
+        fovs = sum(len(w["tiles"]) for w in pooled.values())
+        over_target = sum(1 for w in pooled.values() if len(w["cells"]) > 5)
+        print("    plate: wells=%d acquired=%d FOVs=%d | cross-field duplicates=%d "
+              "cross-field FOV overlaps=%d wells over target=%d"
+              % (len(pooled), acquired, fovs, duplicates, xfield, over_target))
+        check("physical wells", len(pooled), GOLDEN_BAB_WELLS)
+        check("every well has four fields",
+              sorted(set(len(v) for v in fields_per_well.values())), [4])
+        check("plate acquired", acquired, DEFECT_BAB_ACQUIRED)
+        check("plate FOVs", fovs, DEFECT_BAB_FOVS)
+        check("DEFECT: same cell acquired from two fields", duplicates, DEFECT_BAB_DUPLICATES)
+        check("DEFECT: FOVs from different fields overlap", xfield, DEFECT_BAB_XFIELD_FOVS)
+        check("DEFECT: wells exceed the requested cell count", over_target, DEFECT_BAB_OVER_TARGET)
     else:
         print("  SKIP (dataset not present)")
 
