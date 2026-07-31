@@ -517,10 +517,16 @@ def _surs_sample(elig, centre_x, centre_y, n, seed, search_boxes):
     draw = _rng(seed)
     off_x, off_y = draw(), draw()                              # the one random start (offset, both axes)
 
+    # The grid is an unbounded lattice of `step_x` by `step_y` frames shifted by the
+    # random offset, clipped by the scanned area - so the frames at the far edge are
+    # partial, exactly as the frames at the near edge are. Clamping the index instead
+    # would fold that trailing partial frame into the last full one, leaving one frame
+    # (1 + off) steps wide against a first frame of (1 - off): up to a threefold
+    # per-area bias that systematically under-samples the right and bottom of the well.
     frames = {}                                                # (col, row) -> cell indices in that frame
     for i in elig:
-        col = min(n_cols - 1, int((centre_x[i] - x0) / step_x + off_x))
-        row = min(n_rows - 1, int((centre_y[i] - y0) / step_y + off_y))
+        col = int((centre_x[i] - x0) / step_x + off_x)
+        row = int((centre_y[i] - y0) / step_y + off_y)
         frames.setdefault((col, row), []).append(i)
 
     chosen = []                                                # one random cell per occupied frame
@@ -528,10 +534,11 @@ def _surs_sample(elig, centre_x, centre_y, n, seed, search_boxes):
         members = frames[key]
         chosen.append(members[int(draw() * len(members))])
 
-    # Rounding the rectangular grid dimensions can make n_cols * n_rows exceed n
-    # (for example, n=5 on a roughly square well becomes a 2x3 grid). Keep the
-    # spatially uniform frame sample, but randomly discard the surplus frames rather
-    # than returning N+1 cells or truncating in coordinate order.
+    # More frames than n can be occupied: rounding the grid dimensions can already
+    # exceed n (n=5 on a roughly square well becomes a 2x3 grid), and the random
+    # offset adds a partial frame at each far edge. Keep the spatially uniform frame
+    # sample, but randomly discard the surplus rather than returning more than n or
+    # truncating in coordinate order - a random subset of a uniform sample is uniform.
     for i in range(len(chosen) - 1, 0, -1):
         j = int(draw() * (i + 1))
         chosen[i], chosen[j] = chosen[j], chosen[i]
@@ -1122,12 +1129,12 @@ def run_tests():
 
     # Goldens are the values this code produces; pinned so a change is noticed, and
     # verified identical in CPython and Fiji Jython.
-    GOLDEN_TILES = [(800.5, 400.5), (200.5, 1000.5), (1200.5, 600.5),
-                    (1000.5, 1400.5), (200.5, 1400.5)]
+    GOLDEN_TILES = [(1800.5, 1800.5), (1800.5, 1000.5), (0.5, 1800.5),
+                    (200.5, 1000.5), (400.5, 400.5)]
     # Nico plate, gate `mScarlet cells:yes`, FOV 384 px (60x target from a 10x overview),
     # 5 cells/well, seed 42 - the parameters of the production run.
     GOLDEN_POSITIVES, GOLDEN_ELIGIBLE = 4253, 4247
-    GOLDEN_ACQUIRED, GOLDEN_FOVS, GOLDEN_CAPTURED, GOLDEN_EXTRA = 165, 164, 313, 148
+    GOLDEN_ACQUIRED, GOLDEN_FOVS, GOLDEN_CAPTURED, GOLDEN_EXTRA = 167, 166, 282, 115
     NICO_FOV = 384.0
 
     # Babette plate: 2x2 fields per well at 10% overlap, gate `Green:yes; Red:yes`,
@@ -1136,7 +1143,7 @@ def run_tests():
     # deliberate flip to zero rather than an unexplained change in the numbers.
     BABETTE_FOV = 1536.0
     GOLDEN_BAB_WELLS = 40
-    DEFECT_BAB_ACQUIRED, DEFECT_BAB_FOVS = 212, 99
+    DEFECT_BAB_ACQUIRED, DEFECT_BAB_FOVS = 213, 99
     DEFECT_BAB_DUPLICATES, DEFECT_BAB_XFIELD_FOVS, DEFECT_BAB_OVER_TARGET = 7, 19, 17
 
     print("gating")
@@ -1231,6 +1238,23 @@ def run_tests():
     print("    clump share of sample = %.0f%% (its cells are 80%% of all; per-cell would be ~80%%)"
           % (100 * clump_frac))
     check("per-area uniform is not biased by dense clumps", clump_frac < 0.15, True)
+    # Per-area uniformity across the WHOLE extent, not just within a clump: on an even
+    # lattice each half of the scanned area must take half the picks. Folding the
+    # trailing partial frame into the last full one used to draw ~65% from the near half.
+    lattice = [bx(x * 10, y * 10, 1, 1) for x in range(41) for y in range(41)]
+    lx = dict((i, lattice[i][0] + 0.5) for i in range(len(lattice)))
+    ly = dict((i, lattice[i][1] + 0.5) for i in range(len(lattice)))
+    mid_x = (min(lx.values()) + max(lx.values())) / 2.0
+    mid_y = (min(ly.values()) + max(ly.values())) / 2.0
+    picks = [i for sd in range(400)
+             for i in _surs_sample(list(range(len(lattice))), lx, ly, 5, sd, lattice)]
+    near_x = sum(1 for i in picks if lx[i] < mid_x)
+    near_y = sum(1 for i in picks if ly[i] < mid_y)
+    print("    halves took %d / %d (x) and %d / %d (y) of %d picks; equal area -> half"
+          % (near_x, len(picks) - near_x, near_y, len(picks) - near_y, len(picks)))
+    check("per-area uniform across the whole extent, both axes",
+          (abs(2.0 * near_x / len(picks) - 1.0) < 0.10,
+           abs(2.0 * near_y / len(picks) - 1.0) < 0.10), (True, True))
     g7 = [(t["cx"], t["cy"]) for t in select_and_place(field, 100, 0.0, 0.0, 5, 7)[1]]
     print("    tiles(seed 7) = %s" % g7)
     check("requested sample is a hard maximum", len(g7), 5)
