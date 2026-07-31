@@ -558,11 +558,11 @@ def _grow(anchor, available, centre_x, centre_y, half_window):
     accounts for the cell's size and its clear margin). So a set of cells fits one
     FOV exactly when the intersection of their per-axis [centre - half_window,
     centre + half_window] intervals is non-empty. We add nearby cells (nearest
-    first) as long as that intersection survives, and place the FOV at its midpoint
-    - which therefore contains every member, so a cell is only ever listed in a FOV
-    that truly covers it.
+    first) as long as that intersection survives.
 
-    Returns (group, fov_centre_x, fov_centre_y)."""
+    Returns (group, window) where window is (x_lo, x_hi, y_lo, y_hi). Every point in
+    it frames the whole group, so a cell is only ever listed in a FOV that truly
+    covers it, and the caller is free to choose where inside it the FOV sits."""
     x_lo, x_hi = centre_x[anchor] - half_window[anchor], centre_x[anchor] + half_window[anchor]
     y_lo, y_hi = centre_y[anchor] - half_window[anchor], centre_y[anchor] + half_window[anchor]
     group = [anchor]
@@ -578,19 +578,59 @@ def _grow(anchor, available, centre_x, centre_y, half_window):
             x_lo, x_hi, y_lo, y_hi = new_x_lo, new_x_hi, new_y_lo, new_y_hi
             group.append(i)
 
-    return group, (x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0
+    return group, (x_lo, x_hi, y_lo, y_hi)
+
+
+def _clear_of(placed, x, y, fov):
+    """True if a FOV centred at (x, y) images no ground an already placed one covers:
+    two equal FOV squares overlap exactly when their centres are closer than `fov` on
+    BOTH axes. The tolerance absorbs the rounding of a centre computed to sit exactly
+    one FOV width from another."""
+    return all(abs(x - t["cx"]) >= fov - 1e-9 or abs(y - t["cy"]) >= fov - 1e-9
+               for t in placed)
+
+
+def _clear_point(window, placed, fov):
+    """Where to put a FOV inside `window` so it overlaps none already placed, or None.
+
+    Every point of the window frames the whole group, and each placed FOV forbids an
+    open square around its centre, so the free part of the window is bounded by the
+    window's own edges and by the lines one FOV width from a placed centre. If a clear
+    point exists at all, one exists where those lines cross. Prefer the midpoint - it
+    holds the group furthest from the FOV edge - and otherwise take the clear crossing
+    nearest to it, so a cell is only ever given up when its window is genuinely
+    covered rather than merely because the midpoint happened to be taken."""
+    x_lo, x_hi, y_lo, y_hi = window
+    mid_x, mid_y = (x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0
+    if _clear_of(placed, mid_x, mid_y, fov):
+        return mid_x, mid_y
+
+    def crossings(lo, hi, centres):
+        out = [lo, hi, (lo + hi) / 2.0]
+        for c in centres:
+            out += [c - fov, c + fov]
+        return sorted(set(v for v in out if lo <= v <= hi))
+
+    xs = crossings(x_lo, x_hi, [t["cx"] for t in placed])
+    ys = crossings(y_lo, y_hi, [t["cy"] for t in placed])
+    best = None
+    for x in xs:
+        for y in ys:
+            if _clear_of(placed, x, y, fov):
+                reach = (x - mid_x) ** 2 + (y - mid_y) ** 2
+                if best is None or reach < best[0]:
+                    best = (reach, x, y)
+    return (best[1], best[2]) if best else None
 
 
 def _place_disjoint(sampled, centre_x, centre_y, half_window, fov):
     """Place disjoint FOVs over the sampled cells by greedy first-fit.
 
     Walk the sampled cells; for each not-yet-covered one, build the FOV that frames
-    it and any further sampled cells that also fit (several per FOV is fine and free).
-    Reject the FOV if it would overlap one already placed, so no ground is imaged
-    twice: two equal FOV squares overlap iff their centres are less than `fov` apart
-    on BOTH axes. A cell that can only be framed by an overlapping FOV is left
-    unimaged (rare, because the sample is spread out). Greedy first-fit, not a
-    provably minimal cover, but the disjoint sample makes the two coincide in
+    it and any further sampled cells that also fit (several per FOV is fine and free),
+    then put that FOV wherever in its feasible window it images no ground already
+    taken. A cell is left unimaged only when no such point exists. Greedy first-fit,
+    not a provably minimal cover, but the disjoint sample makes the two coincide in
     practice. Returns [ {cx, cy, covered: [cell_index, ...]} ]."""
     placed, covered = [], set()
     for cell in sampled:
@@ -598,14 +638,13 @@ def _place_disjoint(sampled, centre_x, centre_y, half_window, fov):
             continue
 
         remaining = [i for i in sampled if i not in covered]
-        group, fov_x, fov_y = _grow(cell, remaining, centre_x, centre_y, half_window)
+        group, window = _grow(cell, remaining, centre_x, centre_y, half_window)
 
-        overlaps_placed = any(abs(fov_x - t["cx"]) < fov and abs(fov_y - t["cy"]) < fov
-                              for t in placed)
-        if overlaps_placed:
+        point = _clear_point(window, placed, fov)
+        if point is None:
             continue
 
-        placed.append({"cx": fov_x, "cy": fov_y, "covered": sorted(group)})
+        placed.append({"cx": point[0], "cy": point[1], "covered": sorted(group)})
         covered.update(group)
 
     return placed
@@ -1143,8 +1182,8 @@ def run_tests():
     # deliberate flip to zero rather than an unexplained change in the numbers.
     BABETTE_FOV = 1536.0
     GOLDEN_BAB_WELLS = 40
-    DEFECT_BAB_ACQUIRED, DEFECT_BAB_FOVS = 213, 99
-    DEFECT_BAB_DUPLICATES, DEFECT_BAB_XFIELD_FOVS, DEFECT_BAB_OVER_TARGET = 7, 19, 17
+    DEFECT_BAB_ACQUIRED, DEFECT_BAB_FOVS = 231, 112
+    DEFECT_BAB_DUPLICATES, DEFECT_BAB_XFIELD_FOVS, DEFECT_BAB_OVER_TARGET = 7, 23, 20
 
     print("gating")
     n1, n2 = bx(0, 0, 10, 10), bx(100, 0, 10, 10)
@@ -1211,13 +1250,20 @@ def run_tests():
     check("close pair -> 1 FOV, 2 cells", (len(tiles), len(tiles[0]["covered"])), (1, 2))
     _, tiles, _ = select_and_place([bx(0, 0, 10, 10), bx(1000, 0, 10, 10)], 100, 0.0, 0.0, 5, 1)
     check("far pair -> 2 disjoint FOVs", (len(tiles), disjoint(tiles, 100)), (2, True))
-    # reject-and-replace: sample all three; A and B (70 apart, usable 60) cannot share
-    # and their FOVs would overlap, so B is dropped and the two disjoint FOVs frame A
-    # and the far C.
+    # genuinely infeasible, not merely inconvenient: sample all three; A and B (70
+    # apart, usable 60) cannot share a FOV, and B's whole feasible window lies within
+    # one FOV width of A's, so no placement of B clears A and B is given up.
     got, tiles, _ = select_and_place([bx(0, 0, 4, 4), bx(70, 0, 4, 4), bx(1000, 0, 4, 4)],
                                      100, 0.2, 0.0, 3, 5)
-    check("overlap rejected + another cell taken",
+    check("cell given up only when its whole window is covered",
           (len(tiles), disjoint(tiles, 100), set(b[0] for b in got)), (2, True, set([0.0, 1000.0])))
+    # ...whereas a cell whose window merely straddles a placed FOV is shifted clear
+    # rather than dropped: centres 88 apart with a window of +/-27 around each, so the
+    # midpoint sits 88 from the placed FOV (too close) but x = 102 is both a full FOV
+    # width away and still inside the window. Before, this cell was given up.
+    got2, tiles2, _ = select_and_place([bx(0, 0, 4, 4), bx(88, 0, 4, 4)], 100, 0.2, 0.0, 2, 5)
+    check("cell shifted clear instead of dropped",
+          (len(tiles2), disjoint(tiles2, 100), len(got2)), (2, True, 2))
     # a spread field (cells 200 px apart so no two share/overlap a 100 px FOV)
     field = [bx(x * 200, y * 200, 1, 1) for x in range(10) for y in range(10)]
     _, ftiles, _ = select_and_place(field, 100, 0.0, 0.0, 9, 3)
