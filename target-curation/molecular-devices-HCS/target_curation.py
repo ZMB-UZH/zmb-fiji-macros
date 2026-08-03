@@ -534,6 +534,64 @@ def pool_well(by_field, spans):
     return boxes, sources
 
 
+def field_overlap(spans):
+    """How much neighbouring fields of one well overlap, as a fraction of the field
+    along each axis. Either value is None when the well is one field wide on that axis;
+    a negative value means the fields do not meet and part of the well was never
+    imaged. The pitch is the smallest separation between two field origins, so an
+    irregular layout is described by its closest pair rather than assumed regular."""
+    def along(origins, sizes):
+        size = min(sizes)
+        steps = sorted(set(abs(a - b) for a in origins for b in origins))
+        steps = [s for s in steps if s > size * 1e-6]
+        return (size - steps[0]) / size if steps and size > 0 else None
+
+    placed = list(spans.values())
+    if len(placed) < 2:
+        return None, None
+    return (along([p[0] for p in placed], [p[2] for p in placed]),
+            along([p[1] for p in placed], [p[3] for p in placed]))
+
+
+def field_geometry_report(spans):
+    """What the acquisition metadata says about the layout, as lines for the log.
+
+    The overlap reported here is the figure the operator set up in MetaXpress,
+    recovered from the geometry actually recorded, so a plate whose stage positions or
+    overview pixel size are wrong shows as an implausible number instead of being
+    curated silently. Pooling itself never needs this: it asks only which fields
+    contain a point, which is right for any overlap, none at all, or a gap. But nothing
+    else would ever say the recorded layout is not the one on the microscope."""
+    by_well = {}
+    for key, span in spans.items():
+        by_well.setdefault((key[0], key[1], key[3], key[4]), {})[key[2]] = span
+    if not by_well:
+        return [u"field geometry: none recorded (a stitched montage needs none)"]
+
+    widest = max(len(w) for w in by_well.values())
+    lines = [u"field geometry: wells=%d fields=%d max-per-well=%d"
+             % (len(by_well), len(spans), widest)]
+    if widest < 2:
+        return lines + [u"  one field per well - nothing to pool"]
+
+    for name, axis in ((u"x", 0), (u"y", 1)):
+        seen = [field_overlap(w)[axis] for w in by_well.values() if len(w) > 1]
+        seen = [v * 100.0 for v in seen if v is not None]
+        if not seen:
+            continue
+        lo, hi = min(seen), max(seen)
+        lines.append(u"  overlap %s: %s of the field"
+                     % (name, u"%.1f%%" % lo if hi - lo < 0.5
+                        else u"%.1f-%.1f%%" % (lo, hi)))
+        if lo < 0:
+            lines.append(u"  WARNING: fields do not meet on %s - part of the well was "
+                         u"never imaged, and cells there cannot be sampled" % name)
+        elif hi > 50.0:
+            lines.append(u"  WARNING: over half the field overlaps on %s - check the "
+                         u"overview pixel size and the recorded stage positions" % name)
+    return lines
+
+
 # --------------------------------------------------------------------------- #
 # 4. FOV geometry - what fits inside one field, and which cells are eligible    #
 # --------------------------------------------------------------------------- #
@@ -1242,11 +1300,8 @@ def _run_curation(results_path, gate_spec, base, objective, overview_desc,
     # metadata and needs none; a well of several fields cannot be curated without it,
     # and curate() refuses rather than sampling each field as though it were a well.
     spans = read_field_spans(results_path, overview_pixel_size(overview_desc))
-    fields_per_well = {}
-    for key in spans:
-        fields_per_well.setdefault((key[0], key[1], key[3], key[4]), set()).add(key[2])
-    most = max([len(v) for v in fields_per_well.values()] or [1])
-    IJ.log("  field geometry: %d fields measured, up to %d per well" % (len(spans), most))
+    for line in field_geometry_report(spans):
+        IJ.log("  " + line)
 
     IJ.log("  working - curating wells (reading CSVs, sampling, placing FOVs)...")
     IJ.showStatus("MD HCS curation: curating wells...")
@@ -1532,6 +1587,43 @@ def run_tests():
           len(pool_well({0: [bx(90, 40, 4, 4)], 1: [bx(8, 40, 4, 4)]}, seam)[0]), 2)
     check("distinct cells in different fields are both kept",
           len(pool_well({0: [bx(20, 40, 4, 4)], 1: [bx(60, 40, 4, 4)]}, seam)[0]), 2)
+
+    check("the overlap the acquisition recorded is recovered",
+          field_overlap(grid(2, 2, 100, 90)), (0.1, 0.1))
+    check("an overlap that differs per axis is reported per axis",
+          field_overlap(grid(2, 2, 100, 90, 80)), (0.1, 0.2))
+    check("fields that merely abut overlap by nothing",
+          field_overlap(grid(2, 2, 100, 100)), (0.0, 0.0))
+    check("a gap between fields reads as negative overlap",
+          field_overlap(grid(2, 1, 100, 110)), (-0.1, None))
+    check("one field has no overlap to report",
+          field_overlap(grid(1, 1, 100, 100)), (None, None))
+
+    def as_well(spans_of_fields):
+        return dict(((2, 3, f, 0, 0), s) for f, s in spans_of_fields.items())
+
+    check("the report names the layout and the overlap it measured",
+          field_geometry_report(as_well(grid(2, 2, 100, 90))),
+          [u"field geometry: wells=1 fields=4 max-per-well=4",
+           u"  overlap x: 10.0% of the field",
+           u"  overlap y: 10.0% of the field"])
+    check("a montage needs no geometry and the report says so",
+          field_geometry_report({}),
+          [u"field geometry: none recorded (a stitched montage needs none)"])
+    check("one field per well is called out as nothing to pool",
+          field_geometry_report(as_well(grid(1, 1, 100, 100))),
+          [u"field geometry: wells=1 fields=1 max-per-well=1",
+           u"  one field per well - nothing to pool"])
+    check("a gap in the layout is warned about, not just reported",
+          [l for l in field_geometry_report(as_well(grid(2, 1, 100, 110)))
+           if u"WARNING" in l],
+          [u"  WARNING: fields do not meet on x - part of the well was never imaged, "
+           u"and cells there cannot be sampled"])
+    check("an implausible overlap points at the pixel size and stage positions",
+          [l for l in field_geometry_report(as_well(grid(2, 1, 100, 40)))
+           if u"WARNING" in l],
+          [u"  WARNING: over half the field overlaps on x - check the overview pixel "
+           u"size and the recorded stage positions"])
 
     print("SURS + disjoint placement")
     check("oversized cell not eligible", eligible([bx(0, 0, 500, 500)], 100, 0.0, 0.0), [])
