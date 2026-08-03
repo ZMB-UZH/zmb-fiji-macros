@@ -1,0 +1,8 @@
+# These macros are run by two interpreters and each leaves its own bytecode beside
+# the source: CPython when a script is imported as a module or its tests are run,
+# Jython whenever Fiji executes it. Both are regenerated on demand and neither
+# belongs in the repo - a stale one committed here would be loaded in preference to
+# the source it no longer matches.
+__pycache__/
+*.py[cod]
+*$py.class
