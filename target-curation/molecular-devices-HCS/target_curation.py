@@ -834,7 +834,8 @@ def _assert_previous_curation(cur_dir, audit_dir):
 
 
 def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42,
-                         neighbourhood=2.0, stage_margin=0.05, run_note="", base=None, progress=None):
+                         neighbourhood=2.0, stage_margin=0.05, run_note="", base=None,
+                         progress=None, spans=None):
     """Curate and write the result IN PLACE, following the v1 folder convention.
 
     The first run renames IN Carta's `TargetData/` to `TargetData_original/` and never
@@ -867,7 +868,8 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
             os.makedirs(d)
 
     res = curate(orig_dir, gate_spec, fov_px=fov_px, sample_size=sample_size, seed=seed,
-                 neighbourhood=neighbourhood, stage_margin=stage_margin, base=base, progress=progress)
+                 neighbourhood=neighbourhood, stage_margin=stage_margin, base=base,
+                 progress=progress, spans=spans)
     base, output, header = res["base"], res["output"], res["header"]
 
     changes = [u"ZMB MD HCS target curation changes",
@@ -875,7 +877,7 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
                u"Selected object\t" + base,
                u"Acquisition CSV template\t" + output,
                u"Gate\t" + gate_spec,
-               u"Cells per site/field\t%d" % sample_size,
+               u"Cells per well\t%d" % sample_size,
                u"Neighbourhood (%% of radius)\t%g" % (neighbourhood * 100.0),
                u"Stage margin (%% per side)\t%g" % (stage_margin * 100.0),
                u"Seed\t%d" % seed,
@@ -901,15 +903,28 @@ def write_curated_output(results_path, gate_spec, fov_px, sample_size=5, seed=42
 # 10. Curate - run the whole pipeline over every acquisition site/field       #
 # --------------------------------------------------------------------------- #
 def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
-           neighbourhood=2.0, stage_margin=0.05, out_csv=None, base=None, progress=None):
-    """Curate every site/field (gate -> SURS -> disjoint FOVs). `base` is the object
-    class to gate (default: the first channel). Acquisition rows use the highest-T
-    channel's schema, independently of the selected object. The SURS grid spans the whole scanned
-    area (all base objects), so the sample is spread over the site the overview imaged,
-    not just where the positives landed. The per-site seed is `seed + well_index`, so
-    sites are reproducible yet decorrelated (SplitMix64 makes consecutive seeds
-    independent). Returns a dict with per-site results and generated FOV rows; writes
-    the curated CSV if out_csv is given."""
+           neighbourhood=2.0, stage_margin=0.05, out_csv=None, base=None, progress=None,
+           spans=None):
+    """Curate every well (gate -> pool the fields -> SURS -> disjoint FOVs). `base` is
+    the object class to gate (default: the first channel). Acquisition rows use the
+    highest-T channel's schema, independently of the selected object.
+
+    The WELL is the sampling unit, not the acquisition field. A well imaged as several
+    overlapping fields arrives as one CSV per field, so `spans` (from
+    `read_field_spans`) is used to place them in a common frame, keep each piece of
+    ground for the one field that owns it, and sample the well once. Without it a
+    four-field well would ask for `sample_size` cells four times over, count the cells
+    in the overlap band twice, and never notice that two of its FOVs image the same
+    spot. A well of one stitched montage needs no spans and takes exactly the path it
+    always did. The SURS grid spans the whole scanned area (all base objects), so the
+    sample is spread over the ground the overview imaged, not just where the positives
+    landed. The per-well seed is `seed + well_index`, so wells are reproducible yet
+    decorrelated (SplitMix64 makes consecutive seeds independent).
+
+    Results are reported per site, in that field's own coordinates: the caller writes
+    one CSV per field and the reports draw one panel per field, and both would
+    otherwise have to undo the translation. Returns a dict with those per-site results
+    and generated FOV rows; writes the curated CSV if out_csv is given."""
     target_dir = find_target_dir(results_dir)
     name_index, order = discover_signals(target_dir)
     base = base if base in name_index else order[0]
@@ -926,53 +941,119 @@ def curate(results_dir, gate_spec, fov_px=256.0, sample_size=5, seed=42,
         if fn.lower().endswith(".csv"):
             files_by_site.setdefault(_site_of(fn), {})[signal_name(fn)] = fn
 
+    # Wells are enumerated in the order their first site appears in the sorted site
+    # list rather than by re-sorting the parsed keys, because the per-well seed is
+    # `seed + well_index`: a dataset of one field per well must keep the exact index
+    # sequence it had when a site was a well, or every sample it ever produced moves.
+    well_order, sites_of_well = [], {}
+    for site in sorted(files_by_site):
+        key = well_of(site)
+        if key not in sites_of_well:
+            well_order.append(key)
+            sites_of_well[key] = []
+        sites_of_well[key].append(site)
+
     header, wells, fov_rows = None, [], []
-    sites = sorted(files_by_site)
-    for well_index, site in enumerate(sites):
+    half = _usable_half(fov_px, stage_margin)
+    for well_index, key in enumerate(well_order):
         if progress:
-            progress(well_index + 1, len(sites))       # for the caller's status/heartbeat
-        files = files_by_site[site]
-        if base not in files:
+            progress(well_index + 1, len(well_order))  # for the caller's status/heartbeat
+
+        base_by_field, selected_by_field, templates = {}, {}, {}
+        for site in sites_of_well[key]:
+            files = files_by_site[site]
+            if base not in files:
+                continue
+            if output not in files:
+                raise ValueError("Highest-T acquisition channel %s is missing for site %s" %
+                                 (output, site))
+
+            head, base_rows = read_csv(os.path.join(target_dir, files[base]))
+            base_boxes = boxes(base_rows, base_t)
+            output_head, output_rows = read_csv(os.path.join(target_dir, files[output]))
+            header = header or output_head
+
+            gate_boxes = {}
+            for sig in require:
+                rows = read_csv(os.path.join(target_dir, files[sig]))[1] if sig in files else []
+                gate_boxes[sig] = boxes(rows, name_index[sig])
+
+            field = parse_site(site)[2]
+            base_by_field[field] = base_boxes
+            selected_by_field[field] = gate(base_boxes, gate_boxes, require)
+            templates[field] = (site, output_rows[0] if output_rows else {})
+        if not base_by_field:
             continue
-        if output not in files:
-            raise ValueError("Highest-T acquisition channel %s is missing for site %s" %
-                             (output, site))
 
-        head, base_rows = read_csv(os.path.join(target_dir, files[base]))
-        base_boxes = boxes(base_rows, base_t)
-        output_head, output_rows = read_csv(os.path.join(target_dir, files[output]))
-        header = header or output_head
+        fields = sorted(base_by_field)
+        well_spans = {}
+        for field in fields:
+            span = (spans or {}).get((key[0], key[1], field, key[2], key[3]))
+            if span is not None:
+                well_spans[field] = span
+        if len(fields) > 1 and len(well_spans) < len(fields):
+            raise ValueError(
+                "Well R%d-C%d (z%d t%d) was acquired as %d fields but the acquisition "
+                "metadata gives no geometry for all of them, so they cannot be placed in "
+                "one frame. Curating them as independent wells would sample each field "
+                "separately and acquire the overlap twice." % (key + (len(fields),)))
 
-        gate_boxes = {}
-        for sig in require:
-            rows = read_csv(os.path.join(target_dir, files[sig]))[1] if sig in files else []
-            gate_boxes[sig] = boxes(rows, name_index[sig])
-        selected = gate(base_boxes, gate_boxes, require)
+        base_pooled, base_sources = pool_well(base_by_field, well_spans)
+        selected, sel_sources = pool_well(selected_by_field, well_spans)
 
         acquired, tiles, n_eligible = select_and_place(
             selected, fov_px, stage_margin, neighbourhood, sample_size,
-            seed + well_index, search_boxes=base_boxes)
+            seed + well_index, search_boxes=base_pooled)
 
         # positives imaged whole by the FOVs = the sampled targets PLUS any other
         # positive cell that happens to fall entirely inside a field (free extra
         # observations, especially at low mag where the field is large)
-        half = _usable_half(fov_px, stage_margin)
-        captured_boxes = [b for b in selected
-                          if any(_fully_inside(b, t["cx"], t["cy"], half) for t in tiles)]
-        extra_boxes = [b for b in captured_boxes if b not in acquired]   # captured but not sampled
+        acquired_idx = sorted(set(i for t in tiles for i in t["covered"]))
+        captured_idx = [i for i, b in enumerate(selected)
+                        if any(_fully_inside(b, t["cx"], t["cy"], half) for t in tiles)]
+        extra_idx = [i for i in captured_idx if selected[i] not in acquired]
 
-        template = output_rows[0] if output_rows else {}
-        well_fov_rows = [fov_row(template, output_t, t["cx"], t["cy"],
-                                 "FOV_%d" % (len(fov_rows) + i + 1))
-                         for i, t in enumerate(tiles)]
-        fov_rows.extend(well_fov_rows)
+        # Hand every result back to the field it came from, in that field's own
+        # coordinates. A FOV goes to the field that owns the ground under its centre.
+        site_of_field = dict((f, templates[f][0]) for f in fields)
+        parts = dict((templates[f][0], {"base": [], "selected": [], "acquired": [],
+                                        "extra_boxes": [], "captured": 0, "eligible": 0,
+                                        "tiles": [], "fov_rows": []}) for f in fields)
+        for field, local in base_sources:
+            parts[site_of_field[field]]["base"].append(local)
+        for field, local in sel_sources:
+            parts[site_of_field[field]]["selected"].append(local)
+        for i in acquired_idx:
+            parts[site_of_field[sel_sources[i][0]]]["acquired"].append(sel_sources[i][1])
+        for i in captured_idx:
+            parts[site_of_field[sel_sources[i][0]]]["captured"] += 1
+        for i in extra_idx:
+            parts[site_of_field[sel_sources[i][0]]]["extra_boxes"].append(sel_sources[i][1])
+        for i in eligible(selected, fov_px, stage_margin, neighbourhood):
+            parts[site_of_field[sel_sources[i][0]]]["eligible"] += 1
+
+        start = len(fov_rows)
+        for i, tile in enumerate(tiles):
+            home = owning_field(tile["cx"], tile["cy"], well_spans, fields, fields[0])
+            origin = well_spans.get(home, (0.0, 0.0))
+            local = dict(tile)
+            local["cx"], local["cy"] = tile["cx"] - origin[0], tile["cy"] - origin[1]
+            row = fov_row(templates[home][1], output_t, local["cx"], local["cy"],
+                          "FOV_%d" % (start + i + 1))
+            part = parts[site_of_field[home]]
+            part["tiles"].append(local)
+            part["fov_rows"].append(row)
+            fov_rows.append(row)
+
+        # The status describes the well - whether IT yielded the cells asked of it - so
+        # every field of that well reports it, and none of them re-decides it alone.
         status = site_status(n_eligible, len(acquired), sample_size)
-        wells.append({"site": site, "base": base_boxes, "selected": selected,
-                      "acquired": acquired, "captured": len(captured_boxes),
-                      "extra": len(extra_boxes), "extra_boxes": extra_boxes,
-                      "eligible": n_eligible, "status": status,
-                      "sample_short": status != "full",
-                      "tiles": tiles, "fov_rows": well_fov_rows})
+        for f in fields:
+            part = parts[site_of_field[f]]
+            part.update({"site": site_of_field[f], "well": key, "status": status,
+                         "sample_short": status != "full",
+                         "extra": len(part["extra_boxes"])})
+            wells.append(part)
 
     if out_csv and header:
         _write_csv(out_csv, header, fov_rows)
@@ -1157,11 +1238,21 @@ def _run_curation(results_path, gate_spec, base, objective, overview_desc,
         if done == total or done % 10 == 0:
             IJ.log("  ...curated %d/%d sites" % (done, total))
 
-    IJ.log("  working - curating sites (reading CSVs, sampling, placing FOVs)...")
-    IJ.showStatus("MD HCS curation: curating sites...")
+    # Where each acquisition field sits in its well. A stitched montage has no such
+    # metadata and needs none; a well of several fields cannot be curated without it,
+    # and curate() refuses rather than sampling each field as though it were a well.
+    spans = read_field_spans(results_path, overview_pixel_size(overview_desc))
+    fields_per_well = {}
+    for key in spans:
+        fields_per_well.setdefault((key[0], key[1], key[3], key[4]), set()).add(key[2])
+    most = max([len(v) for v in fields_per_well.values()] or [1])
+    IJ.log("  field geometry: %d fields measured, up to %d per well" % (len(spans), most))
+
+    IJ.log("  working - curating wells (reading CSVs, sampling, placing FOVs)...")
+    IJ.showStatus("MD HCS curation: curating wells...")
     res, cur_dir, audit_dir = write_curated_output(
         results_path, gate_spec, fov_px, sample_size, seed, neighbourhood, stage_margin,
-        run_note=str(Date()), base=base, progress=tick)
+        run_note=str(Date()), base=base, progress=tick, spans=spans)
 
     IJ.log("  working - rendering %d per-site reports + plate overview..." % len(res["wells"]))
     report_dir = os.path.join(audit_dir, "report")
@@ -1176,10 +1267,13 @@ def _run_curation(results_path, gate_spec, base, objective, overview_desc,
     acquired = sum(len(w["acquired"]) for w in res["wells"])
     extra = sum(w["extra"] for w in res["wells"])
     fovs = sum(len(w["tiles"]) for w in res["wells"])
-    under = sum(1 for w in res["wells"] if w["status"] != "full")
-    constrained = sum(1 for w in res["wells"] if w["status"] == "constrained")
-    IJ.log("  sites=%d acquired=%d extra-whole=%d FOVs=%d under-sampled=%d constrained=%d"
-           % (len(res["wells"]), acquired, extra, fovs, under, constrained))
+    # Status belongs to the well, and every field of that well carries it, so the
+    # shortfalls are counted over distinct wells rather than once per field.
+    by_well = dict((w["well"], w["status"]) for w in res["wells"])
+    under = sum(1 for s in by_well.values() if s != "full")
+    constrained = sum(1 for s in by_well.values() if s == "constrained")
+    IJ.log("  wells=%d sites=%d acquired=%d extra-whole=%d FOVs=%d under-sampled=%d constrained=%d"
+           % (len(by_well), len(res["wells"]), acquired, extra, fovs, under, constrained))
     IJ.log("  curated TargetData -> %s" % cur_dir)
     IJ.log("  mirror + changes   -> %s" % audit_dir)
     return res
@@ -1248,12 +1342,24 @@ def run_macro():
 # points at the untouched `- Copy`: the sibling folder without the suffix has already
 # been curated in place, so its TargetData/ holds generated FOV rows rather than IN
 # Carta's original objects.
+# The standing single-field control: six wells, one stitched montage each, one signal.
+# Read TargetData_original, never TargetData - this folder has been curated in place,
+# so its TargetData/ holds generated FOV rows rather than IN Carta's own objects.
+CONTROL_RESULTS = (r"Z:\transfer\Thom\10306\FIJI_Target_Curation_Test"
+                   r"\0306_H2BmCherry_OVWF10x_TXRED"
+                   r"\10306_H2BmCherry_OVWF10x_TXRED_20260429_151322\experiment\Results"
+                   r"\curation test_2026-Apr-29-15-23-15-269\TargetData_original")
+# A plate acquired as several fields per well, to run the well-level invariants
+# against real geometry. The Babette plate this was written for is no longer on the
+# share; point this at the next multi-field plate that is.
+MULTIFIELD_RESULTS = (r"Z:\transfer\Thom\Babette MD"
+                      r"\26.19 NPTX2 ASO IF test_20260722_104349\experiment"
+                      r"\Results\TriplePositive_Thom_2026-Jul-22-12-20-15-690")
+MULTIFIELD_GATE, MULTIFIELD_FOV = "Green:yes; Red:yes", 1536.0
+# The Nico plate the montage goldens below were measured on, also gone from the share.
 NICO_RESULTS = (r"Z:\transfer\Thom\Nico MD"
                 r"\NB26-15_Overview10x_DAPI-mScarlet_20260713_152811\experiment_montage"
                 r"\Results\mScarlet Cells_2026-Jul-13-17-23-33-077 - Copy")
-BABETTE_RESULTS = (r"Z:\transfer\Thom\Babette MD"
-                   r"\26.19 NPTX2 ASO IF test_20260722_104349\experiment"
-                   r"\Results\TriplePositive_Thom_2026-Jul-22-12-20-15-690")
 
 
 def run_tests():
@@ -1283,14 +1389,12 @@ def run_tests():
     GOLDEN_ACQUIRED, GOLDEN_FOVS, GOLDEN_CAPTURED, GOLDEN_EXTRA = 167, 166, 282, 115
     NICO_FOV = 384.0
 
-    # Babette plate: 2x2 fields per well at 10% overlap, gate `Green:yes; Red:yes`,
-    # FOV 1536 px (60x target from a 40x overview). DEFECT_* are what the per-field
-    # pipeline produces today; pinning them makes the well-level fix show up as a
-    # deliberate flip to zero rather than an unexplained change in the numbers.
-    BABETTE_FOV = 1536.0
-    GOLDEN_BAB_WELLS = 40
-    DEFECT_BAB_ACQUIRED, DEFECT_BAB_FOVS = 231, 112
-    DEFECT_BAB_DUPLICATES, DEFECT_BAB_XFIELD_FOVS, DEFECT_BAB_OVER_TARGET = 7, 23, 20
+    # The single-field control plate, FOV 384 px, 5 cells/well, seed 42. Measured on
+    # the code as it stood before well-level pooling and confirmed unmoved by it, so
+    # these numbers pin the montage path itself, not merely today's output.
+    CONTROL_FOV = 384.0
+    CONTROL_POSITIVES, CONTROL_ELIGIBLE = 1637, 1637
+    CONTROL_ACQUIRED, CONTROL_FOVS, CONTROL_CAPTURED, CONTROL_EXTRA = 30, 28, 240, 210
 
     print("gating")
     n1, n2 = bx(0, 0, 10, 10), bx(100, 0, 10, 10)
@@ -1515,11 +1619,15 @@ def run_tests():
     check("40x -> 576 px", fov["40x"], 576.0)
     check("60x -> 384 px", fov["60x"], 384.0)
     check("60x + 1.5x changer -> 256 px", fov["60x + 1.5x changer"], 256.0)
-    real_ov = (_overview_tiff_path(BABETTE_RESULTS)
-               if os.path.isdir(os.path.join(BABETTE_RESULTS, "TargetData")) else None)
+    # Read a real MetaXpress TIFF header, whichever plate is on the share. The optics
+    # are the plate's own, so what is checked is that the fields come back usable - a
+    # magnification, a binning and a region the FOV arithmetic can be driven with.
+    real_ov = (_overview_tiff_path(MULTIFIELD_RESULTS)
+               if os.path.isdir(os.path.join(MULTIFIELD_RESULTS, "TargetData")) else None)
     if real_ov and os.path.isfile(real_ov):
-        check("real overview TIFF scale read", overview_scale(read_image_description(real_ov)),
-              (40.0, 1.0, 1, 2304))
+        mag_r, changer_r, binning_r, region_r = overview_scale(read_image_description(real_ov))
+        check("real overview TIFF scale read",
+              (mag_r > 0, changer_r > 0, binning_r >= 1, region_r > 0), (True,) * 4)
     else:
         print("  SKIP real overview TIFF (not present)")
 
@@ -1542,12 +1650,12 @@ def run_tests():
         check("overview image found by walking up from results", _overview_tiff_path(analysis), ov)
     finally:
         shutil.rmtree(ov_tmp, ignore_errors=True)
-    if os.path.isdir(os.path.join(BABETTE_RESULTS, "TargetData")):
-        real_desc = overview_from_results(BABETTE_RESULTS)
+    if os.path.isdir(os.path.join(MULTIFIELD_RESULTS, "TargetData")):
+        real_desc = overview_from_results(MULTIFIELD_RESULTS)
         check("overview auto-found + scaled from real results",
-              overview_scale(real_desc), (40.0, 1.0, 1, 2304))
+              overview_scale(real_desc)[0] > 0, True)
         check("overview pixel size read from the same image",
-              overview_pixel_size(real_desc), 0.1621)
+              overview_pixel_size(real_desc) > 0, True)
     else:
         print("  SKIP overview auto-discovery on real results (not present)")
 
@@ -1593,7 +1701,100 @@ def run_tests():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    print("real data (auto-skip)")
+    print("one well, four overlapping fields (synthetic)")
+    tmp4 = tempfile.mkdtemp()
+    try:
+        FIELD, PITCH, FOV4 = 2304.0, 2073.5, 200.0        # 2x2 fields at 10% overlap
+        origins4 = {0: (0.0, 0.0), 1: (PITCH, 0.0), 2: (0.0, PITCH), 3: (PITCH, PITCH)}
+        spans4 = dict(((2, 3, f, 0, 0), (ox, oy, FIELD, FIELD))
+                      for f, (ox, oy) in origins4.items())
+
+        # Six physical cells: one in the interior of each field, one in the vertical
+        # seam and one in the four-way corner. The seam cell falls in two fields'
+        # images and the corner cell in all four, so the four CSVs hold ten rows.
+        cells4 = [(500.0, 500.0), (3000.0, 500.0), (500.0, 3000.0), (3000.0, 3000.0),
+                  (2150.0, 500.0), (2150.0, 2150.0)]
+        td4 = os.path.join(tmp4, "TargetData")
+        os.makedirs(td4)
+        rows_written = 0
+        for f, (ox, oy) in sorted(origins4.items()):
+            local = [(x - ox, y - oy) for x, y in cells4
+                     if ox <= x <= ox + FIELD and oy <= y <= oy + FIELD]
+            rows_written += len(local)
+            dapi4 = ["object_id,well_label,T1$AS_FID_Blob_BoundingBoxX,T1$AS_FID_Blob_BoundingBoxY,"
+                     "T1$AS_FID_Blob_BoundingBoxWidth,T1$AS_FID_Blob_BoundingBoxHeight"]
+            ms4 = ["object_id,T2$AS_FID_Blob_BoundingBoxX,T2$AS_FID_Blob_BoundingBoxY,"
+                   "T2$AS_FID_Blob_BoundingBoxWidth,T2$AS_FID_Blob_BoundingBoxHeight"]
+            for i, (x, y) in enumerate(local):
+                dapi4.append("%d,B - 3,%g,%g,20,20" % (i, x - 10, y - 10))
+                ms4.append("%d,%g,%g,12,12" % (i, x - 6, y - 6))
+            for name, lines in (("DAPI", dapi4), ("mScarlet cells", ms4)):
+                with io.open(os.path.join(td4, "%s_singleTargetData_R2-C03-F%d-Z0-T0.csv"
+                                          % (name, f)), "w", encoding="utf-8", newline="") as fh:
+                    fh.write(u"\r\n".join(lines) + u"\r\n")
+        check("the four CSVs hold ten rows for six cells", rows_written, 10)
+
+        try:
+            curate(tmp4, "mScarlet cells:yes", fov_px=FOV4, sample_size=3)
+            refused = False
+        except ValueError:
+            refused = True
+        check("four fields without measured geometry is a hard failure", refused, True)
+
+        res4 = curate(tmp4, "mScarlet cells:yes", fov_px=FOV4, sample_size=3, spans=spans4)
+        placed4 = []
+        for w in res4["wells"]:
+            ox, oy = origins4[parse_site(w["site"])[2]]
+            placed4 += [(t["cx"] + ox, t["cy"] + oy) for t in w["tiles"]]
+        clashes = sum(1 for i, a in enumerate(placed4) for b in placed4[i + 1:]
+                      if abs(a[0] - b[0]) < FOV4 and abs(a[1] - b[1]) < FOV4)
+        owns_seam = [w["site"] for w in res4["wells"]
+                     for b in w["selected"]
+                     if abs(b[0] + b[2] / 2.0 - 2150.0) < 1e-9
+                     and abs(b[1] + b[3] / 2.0 - 500.0) < 1e-9]
+
+        check("the well is still reported as its four fields", len(res4["wells"]), 4)
+        check("a cell imaged by several fields is curated once",
+              sum(len(w["selected"]) for w in res4["wells"]), 6)
+        check("the sample is drawn once for the well, not once per field",
+              sum(len(w["acquired"]) for w in res4["wells"]), 3)
+        check("no two of the well's FOVs overlap in well coordinates", clashes, 0)
+        check("a seam cell goes to the field whose centre is nearest",
+              owns_seam, ["R2-C03-F0-Z0-T0"])
+        check("every field of the well reports the well's own status",
+              sorted(set(w["status"] for w in res4["wells"])), ["full"])
+        check("captured == acquired + extra across the well",
+              (sum(w["captured"] for w in res4["wells"]),
+               sum(len(w["acquired"]) + w["extra"] for w in res4["wells"])),
+              (3, 3))
+    finally:
+        shutil.rmtree(tmp4, ignore_errors=True)
+
+    print("real data - single-field montage control (auto-skip)")
+    if os.path.isdir(CONTROL_RESULTS):
+        res = curate(CONTROL_RESULTS, "Nuclei:yes", fov_px=CONTROL_FOV)
+        pos = sum(len(w["selected"]) for w in res["wells"])
+        acquired = sum(len(w["acquired"]) for w in res["wells"])
+        captured = sum(w["captured"] for w in res["wells"])
+        extra = sum(w["extra"] for w in res["wells"])
+        fovs = sum(len(w["tiles"]) for w in res["wells"])
+        print("    plate: positives=%d acquired=%d extra=%d captured=%d FOVs=%d"
+              % (pos, acquired, extra, captured, fovs))
+        check("control signals discovered", res["signals"], ["Nuclei"])
+        check("control is one field per well",
+              sorted(set(parse_site(w["site"])[2] for w in res["wells"])), [0])
+        check("control positives (golden)", pos, CONTROL_POSITIVES)
+        check("control eligible (golden)",
+              sum(w["eligible"] for w in res["wells"]), CONTROL_ELIGIBLE)
+        check("control acquired (golden)", acquired, CONTROL_ACQUIRED)
+        check("control FOVs (golden)", fovs, CONTROL_FOVS)
+        check("control captured (golden)", captured, CONTROL_CAPTURED)
+        check("control extra/bonus (golden)", extra, CONTROL_EXTRA)
+        check("control captured == acquired + extra", captured, acquired + extra)
+    else:
+        print("  SKIP (dataset not present)")
+
+    print("real data - the retired Nico plate (auto-skip)")
     if os.path.isdir(os.path.join(NICO_RESULTS, "TargetData")):
         res = curate(NICO_RESULTS, "mScarlet cells:yes", fov_px=NICO_FOV)
         pos = sum(len(w["selected"]) for w in res["wells"])
@@ -1623,24 +1824,25 @@ def run_tests():
     else:
         print("  SKIP (dataset not present)")
 
-    print("four overlapping fields per well (auto-skip)")
-    if os.path.isdir(os.path.join(BABETTE_RESULTS, "TargetData")):
-        res = curate(BABETTE_RESULTS, "Green:yes; Red:yes", fov_px=BABETTE_FOV)
+    # A real multi-field plate, whenever one is on the share. The counts depend on the
+    # plate, so what is asserted here are the invariants the well-level path must hold
+    # on any of them - the same three the synthetic four-field well pins exactly.
+    print("real data - multi-field plate (auto-skip)")
+    if os.path.isdir(os.path.join(MULTIFIELD_RESULTS, "TargetData")):
         spans = read_field_spans(
-            BABETTE_RESULTS, overview_pixel_size(overview_from_results(BABETTE_RESULTS)))
+            MULTIFIELD_RESULTS,
+            overview_pixel_size(overview_from_results(MULTIFIELD_RESULTS)))
+        res = curate(MULTIFIELD_RESULTS, MULTIFIELD_GATE, fov_px=MULTIFIELD_FOV, spans=spans)
 
-        # Regroup the per-site results into physical wells, moving each site's cells and
-        # FOVs into well coordinates with the measured field origins. This is what the
-        # selection path cannot see today, which is why the duplicates below exist.
         pooled, fields_per_well = {}, {}
         for w in res["wells"]:
-            row, col, fld, z, tp = parse_site(w["site"])
-            ox, oy = spans[(row, col, fld, z, tp)][:2]
-            fields_per_well.setdefault((row, col, z, tp), set()).add(fld)
-            cur = pooled.setdefault((row, col, z, tp), {"cells": [], "tiles": []})
-            cur["cells"] += [(b[0] + b[2] / 2.0 + ox, b[1] + b[3] / 2.0 + oy, fld)
+            field = parse_site(w["site"])[2]
+            ox, oy = spans[parse_site(w["site"])][:2]
+            fields_per_well.setdefault(w["well"], set()).add(field)
+            cur = pooled.setdefault(w["well"], {"cells": [], "tiles": []})
+            cur["cells"] += [(b[0] + b[2] / 2.0 + ox, b[1] + b[3] / 2.0 + oy, field)
                              for b in w["acquired"]]
-            cur["tiles"] += [(tl["cx"] + ox, tl["cy"] + oy, fld) for tl in w["tiles"]]
+            cur["tiles"] += [(t["cx"] + ox, t["cy"] + oy, field) for t in w["tiles"]]
 
         def cross_field(well, key, near):
             items = well[key]
@@ -1651,22 +1853,18 @@ def run_tests():
                                      (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 < 40.0 ** 2)
                          for w in pooled.values())
         xfield = sum(cross_field(w, "tiles", lambda a, b:
-                                 abs(a[0] - b[0]) < BABETTE_FOV and abs(a[1] - b[1]) < BABETTE_FOV)
+                                 abs(a[0] - b[0]) < MULTIFIELD_FOV
+                                 and abs(a[1] - b[1]) < MULTIFIELD_FOV)
                      for w in pooled.values())
-        acquired = sum(len(w["cells"]) for w in pooled.values())
-        fovs = sum(len(w["tiles"]) for w in pooled.values())
         over_target = sum(1 for w in pooled.values() if len(w["cells"]) > 5)
-        print("    plate: wells=%d acquired=%d FOVs=%d | cross-field duplicates=%d "
-              "cross-field FOV overlaps=%d wells over target=%d"
-              % (len(pooled), acquired, fovs, duplicates, xfield, over_target))
-        check("physical wells", len(pooled), GOLDEN_BAB_WELLS)
-        check("every well has four fields",
-              sorted(set(len(v) for v in fields_per_well.values())), [4])
-        check("plate acquired", acquired, DEFECT_BAB_ACQUIRED)
-        check("plate FOVs", fovs, DEFECT_BAB_FOVS)
-        check("DEFECT: same cell acquired from two fields", duplicates, DEFECT_BAB_DUPLICATES)
-        check("DEFECT: FOVs from different fields overlap", xfield, DEFECT_BAB_XFIELD_FOVS)
-        check("DEFECT: wells exceed the requested cell count", over_target, DEFECT_BAB_OVER_TARGET)
+        print("    plate: wells=%d fields/well=%s acquired=%d FOVs=%d"
+              % (len(pooled), sorted(set(len(v) for v in fields_per_well.values())),
+                 sum(len(w["cells"]) for w in pooled.values()),
+                 sum(len(w["tiles"]) for w in pooled.values())))
+        check("more than one field per well", max(len(v) for v in fields_per_well.values()) > 1, True)
+        check("no cell is acquired from two fields of one well", duplicates, 0)
+        check("no two FOVs of one well overlap", xfield, 0)
+        check("no well exceeds the requested cell count", over_target, 0)
     else:
         print("  SKIP (dataset not present)")
 
