@@ -396,34 +396,142 @@ def _acquisition_metadata_path(results_dir):
     return None
 
 
-def field_origins(rows, pixel_um):
-    """Map (row, col, field, z, time) to a well-local field origin in pixels."""
-    centres = {}
+def well_of(site):
+    """The physical well and facet a site belongs to: (row, column, z, time). The four
+    fields of one well share this key; z and time stay separate because they are
+    separate images of that well, not more of the same one."""
+    row, col, _field, z, time = parse_site(site)
+    return row, col, z, time
+
+
+def field_spans(rows, pixel_um):
+    """Map (row, col, field, z, time) to that field's (x, y, width, height) in
+    well-local pixels - where the field sits within its well, and how much of the well
+    it images.
+
+    Stage positions are recorded in micrometres and image sizes in pixels, so the
+    origin is converted with the overview's own pixel size; the well's frame is
+    anchored at its top-left-most field. The size comes from the acquisition's own
+    `ImageSizeXPx`/`ImageSizeYPx` rather than the camera's sensor region, which is
+    recorded unbinned and says nothing about a stitched montage."""
+    placed = {}
     for row in rows:
         try:
             key = (int(row["Row"]), int(row["Column"]), int(row["Field"]),
                    int(row["ZIndex"]), int(row["Timepoint"]))
-            centres.setdefault(key, (float(row["PositionXUm"]), float(row["PositionYUm"])))
+            placed.setdefault(key, (float(row["PositionXUm"]), float(row["PositionYUm"]),
+                                    float(row["ImageSizeXPx"]), float(row["ImageSizeYPx"])))
         except (KeyError, ValueError):
             pass
-    groups = {}
-    for key, centre in centres.items():
-        groups.setdefault((key[0], key[1], key[3], key[4]), []).append(centre)
-    origins = {}
-    for key, (x, y) in centres.items():
-        group = groups[(key[0], key[1], key[3], key[4])]
-        origins[key] = ((x - min(p[0] for p in group)) / pixel_um,
-                        (y - min(p[1] for p in group)) / pixel_um)
-    return origins
+    anchors = {}
+    for key in sorted(placed):
+        x, y = placed[key][0], placed[key][1]
+        well = (key[0], key[1], key[3], key[4])
+        at = anchors.get(well)
+        anchors[well] = (x, y) if at is None else (min(at[0], x), min(at[1], y))
+    spans = {}
+    for key in sorted(placed):
+        x, y, width, height = placed[key]
+        anchor_x, anchor_y = anchors[(key[0], key[1], key[3], key[4])]
+        spans[key] = ((x - anchor_x) / pixel_um, (y - anchor_y) / pixel_um, width, height)
+    return spans
 
 
-def read_field_origins(results_dir, pixel_um=None):
-    """Physical field origins for rendering, or an empty mapping if unavailable."""
+def read_field_spans(results_dir, pixel_um=None):
+    """Measured field spans for this dataset, or an empty mapping when the acquisition
+    metadata is not beside the analysis (a stitched montage has none, and needs none)."""
     path = _acquisition_metadata_path(results_dir)
     pixel_um = pixel_um or overview_pixel_size(overview_from_results(results_dir))
     if not path or not pixel_um:
         return {}
-    return field_origins(read_csv(path)[1], pixel_um)
+    return field_spans(read_csv(path)[1], pixel_um)
+
+
+def owning_field(x, y, spans, fields, source):
+    """Which field owns the point (x, y) of the well, so that ground imaged by more
+    than one overlapping field is counted once.
+
+    The owner is the field whose centre is nearest among those whose image actually
+    contains the point, ties going to the lowest field number. Containment stops a
+    field owning ground it never imaged; nearest-centre puts the boundary on the
+    midline between neighbours - for a regular grid exactly half the overlap off each
+    shared edge - so every point is owned by the field that sees it furthest from its
+    own edge, where the segmentation is most trustworthy. Ownership is decided by
+    position, never by matching two detections, so it is unaffected by the two fields
+    disagreeing about a cell's outline. `source` is returned when no field contains the
+    point, so a detection can never be orphaned by the field geometry."""
+    best = None
+    for field in fields:
+        span = spans.get(field)
+        if span is None:
+            continue
+        ox, oy, width, height = span
+        if not (ox <= x <= ox + width and oy <= y <= oy + height):
+            continue
+        reach = (x - (ox + width / 2.0)) ** 2 + (y - (oy + height / 2.0)) ** 2
+        if best is None or (reach, field) < best:
+            best = (reach, field)
+    return source if best is None else best[1]
+
+
+def pool_well(by_field, spans):
+    """One deduplicated population for a physical well, in well coordinates.
+
+    `by_field` maps a field number to that field's boxes in its own image coordinates.
+    Every box is placed in the well and kept only by the field that owns where its
+    centre lies, which removes the copies overlapping fields make of the same ground.
+    What ownership cannot remove is a cell the two fields segmented slightly
+    differently, whose two centres straddle the boundary and are therefore owned by
+    different fields; those are collapsed by dropping the higher-numbered field's copy
+    when two survivors from different fields sit closer together than the smaller
+    one's own radius - a separation two distinct cells cannot have.
+
+    Returns (boxes, sources): boxes in well coordinates, and sources[i] the (field,
+    box) it came from, so every result can be reported in that field's own frame
+    without ever undoing the translation and losing bits to rounding."""
+    fields = sorted(by_field)
+    kept = []
+    for field in fields:
+        span = spans.get(field)
+        ox, oy = (span[0], span[1]) if span else (0.0, 0.0)
+        for box in by_field[field]:
+            moved = (box[0] + ox, box[1] + oy, box[2], box[3])
+            if owning_field(moved[0] + moved[2] / 2.0, moved[1] + moved[3] / 2.0,
+                            spans, fields, field) == field:
+                kept.append((moved, field, box))
+
+    if len(fields) < 2:                    # a stitched montage: nothing to deduplicate
+        return [k[0] for k in kept], [(k[1], k[2]) for k in kept]
+
+    # Twins lie within one cell radius of each other, so each box is compared only
+    # against those in its own and the neighbouring buckets of a grid coarser than any
+    # cell. Comparing every pair would be quadratic in the well's whole population,
+    # which a well of tens of thousands of nuclei cannot afford under Jython.
+    radius = max([cell_radius(m) for m, _, _ in kept] or [0.0])
+    reach = radius * 2.0 if radius > 0 else 1.0
+    centres = [(m[0] + m[2] / 2.0, m[1] + m[3] / 2.0) for m, _, _ in kept]
+    buckets = {}
+    for index, (x, y) in enumerate(centres):
+        buckets.setdefault((int(x // reach), int(y // reach)), []).append(index)
+
+    boxes, sources = [], []
+    for index, (moved, field, box) in enumerate(kept):
+        x, y = centres[index]
+        col, row = int(x // reach), int(y // reach)
+        twin = False
+        for dcol in (-1, 0, 1):
+            for drow in (-1, 0, 1):
+                for other in buckets.get((col + dcol, row + drow), []):
+                    if kept[other][1] >= field:
+                        continue
+                    ox, oy = centres[other]
+                    if ((x - ox) ** 2 + (y - oy) ** 2 <
+                            min(cell_radius(moved), cell_radius(kept[other][0])) ** 2):
+                        twin = True
+        if not twin:
+            boxes.append(moved)
+            sources.append((field, box))
+    return boxes, sources
 
 
 # --------------------------------------------------------------------------- #
@@ -937,7 +1045,7 @@ def _render_plate_overview(res, path, fov_px, overview_desc=""):
                                       Color(26, 152, 80), Color(202, 0, 32), Color(5, 113, 176))
     by_site = dict((w["site"], w) for w in res["wells"])
     max_x, max_y = dataset_extent(res["wells"])
-    origins = read_field_origins(res["target_dir"], overview_pixel_size(overview_desc))
+    spans = read_field_spans(res["target_dir"], overview_pixel_size(overview_desc))
     saved = []
 
     for facet in sorted(layout):
@@ -966,10 +1074,9 @@ def _render_plate_overview(res, path, fov_px, overview_desc=""):
         site_origins = {}
         for site, slot in slots.items():
             key = parse_site(site)
-            measured = origins.get(key)
-            if measured is None:
-                measured = (slot["field_col"] * max_x, slot["field_row"] * max_y)
-            site_origins[site] = measured
+            measured = spans.get(key)
+            site_origins[site] = ((measured[0], measured[1]) if measured is not None else
+                                  (slot["field_col"] * max_x, slot["field_row"] * max_y))
         extent_x = max(site_origins[s][0] + max_x for s in slots)
         extent_y = max(site_origins[s][1] + max_y for s in slots)
         scale = min((panel - 8.0) / extent_x, (panel - well_top - 4.0) / extent_y)
@@ -1226,23 +1333,101 @@ def run_tests():
     check("dataset extent spans every site",
           dataset_extent([{"base": [(0, 0, 10, 20)]},
                           {"base": [(100, 50, 5, 7)]}]), (105, 57))
-    metadata_rows = [
-        {"Row": "3", "Column": "2", "Field": "0", "ZIndex": "0", "Timepoint": "0",
-         "PositionXUm": "10", "PositionYUm": "20"},
-        {"Row": "3", "Column": "2", "Field": "1", "ZIndex": "0", "Timepoint": "0",
-         "PositionXUm": "10", "PositionYUm": "30"},
-        {"Row": "3", "Column": "2", "Field": "2", "ZIndex": "0", "Timepoint": "0",
-         "PositionXUm": "25", "PositionYUm": "30"}]
-    check("stage metadata becomes well-local pixel origins",
-          field_origins(metadata_rows, 0.5),
-          {(3, 2, 0, 0, 0): (0.0, 0.0),
-           (3, 2, 1, 0, 0): (0.0, 20.0),
-           (3, 2, 2, 0, 0): (30.0, 20.0)})
+    def meta_row(field, x, y):
+        return {"Row": "3", "Column": "2", "Field": str(field), "ZIndex": "0",
+                "Timepoint": "0", "PositionXUm": str(x), "PositionYUm": str(y),
+                "ImageSizeXPx": "100", "ImageSizeYPx": "80"}
+
+    metadata_rows = [meta_row(0, 10, 20), meta_row(1, 10, 30), meta_row(2, 25, 30)]
+    check("stage metadata becomes well-local pixel spans",
+          field_spans(metadata_rows, 0.5),
+          {(3, 2, 0, 0, 0): (0.0, 0.0, 100.0, 80.0),
+           (3, 2, 1, 0, 0): (0.0, 20.0, 100.0, 80.0),
+           (3, 2, 2, 0, 0): (30.0, 20.0, 100.0, 80.0)})
+    check("a field without a recorded image size is left out",
+          field_spans([{"Row": "3", "Column": "2", "Field": "0", "ZIndex": "0",
+                        "Timepoint": "0", "PositionXUm": "10", "PositionYUm": "20"}], 0.5), {})
+    check("the well key drops the field but keeps the z/time facet",
+          well_of("R2-C3-F1-Z0-T4"), (2, 3, 0, 4))
 
     faceted = build_overview_layout(
         [{"site": "R3-C2-F0-Z0-T0"}, {"site": "R3-C2-F0-Z1-T0"},
          {"site": "R3-C2-F0-Z0-T1"}])
     check("Z/T variants are separate facets", sorted(faceted), [(0, 0), (0, 1), (1, 0)])
+
+    print("pooling overlapping fields into one well")
+
+    def grid(cols, rows, size, pitch_x, pitch_y=None):
+        """Fields of one well on a regular grid, numbered row-major."""
+        pitch_y = pitch_x if pitch_y is None else pitch_y
+        return dict((r * cols + c, (c * pitch_x * 1.0, r * pitch_y * 1.0,
+                                    size * 1.0, size * 1.0))
+                    for r in range(rows) for c in range(cols))
+
+    def lattice(spans, step):
+        """Every lattice point the fields image, with its owner and the fields that
+        actually contain it - the sampled stand-in for 'the whole imaged area'."""
+        fields = sorted(spans)
+        far_x = max(spans[f][0] + spans[f][2] for f in fields)
+        far_y = max(spans[f][1] + spans[f][3] for f in fields)
+        out = {}
+        for i in range(int(far_x / step) + 1):
+            for j in range(int(far_y / step) + 1):
+                x, y = i * step * 1.0, j * step * 1.0
+                inside = [f for f in fields
+                          if spans[f][0] <= x <= spans[f][0] + spans[f][2]
+                          and spans[f][1] <= y <= spans[f][1] + spans[f][3]]
+                if inside:
+                    out[(x, y)] = (owning_field(x, y, spans, fields, -1), inside)
+        return out
+
+    def trimmed(x, y, cols, rows, size, pitch_x, pitch_y):
+        """The owner under the textbook rule for a regular grid - half of every shared
+        overlap trimmed off each side - which the nearest-centre partition must
+        reproduce cell for cell."""
+        col = sum(1 for c in range(cols - 1) if x > c * pitch_x + (size + pitch_x) / 2.0)
+        row = sum(1 for r in range(rows - 1) if y > r * pitch_y + (size + pitch_y) / 2.0)
+        return row * cols + col
+
+    for label, cols, rows, size, pitch_x, pitch_y in [
+            ("one field", 1, 1, 100, 100, 100),
+            ("2x2 at 10% overlap", 2, 2, 100, 90, 90),
+            ("3x3 at 10% overlap", 3, 3, 100, 90, 90),
+            ("unequal overlap per axis", 2, 2, 100, 90, 80),
+            ("abutting fields, no overlap", 2, 2, 100, 100, 100)]:
+        spans_case = grid(cols, rows, size, pitch_x, pitch_y)
+        points = lattice(spans_case, 5)
+        orphans = sum(1 for own, inside in points.values() if own not in inside)
+        strays = sum(1 for (x, y), (own, _) in points.items()
+                     if own != trimmed(x, y, cols, rows, size, pitch_x, pitch_y))
+        check("%s: every imaged point is owned by a field that imaged it" % label, orphans, 0)
+        check("%s: ownership is exactly a half-overlap trim" % label, strays, 0)
+
+    g22 = grid(2, 2, 100, 90)
+    check("a point exactly on the midline goes to the lower field number",
+          owning_field(95.0, 50.0, g22, sorted(g22), -1), 0)
+    check("the four-way corner point goes to the lowest field number",
+          owning_field(95.0, 95.0, g22, sorted(g22), -1), 0)
+    gapped = grid(2, 1, 100, 110)
+    check("a point in a gap between fields keeps the field it was detected in",
+          owning_field(105.0, 50.0, gapped, sorted(gapped), 7), 7)
+
+    seam = {0: (0.0, 0.0, 100.0, 100.0), 1: (90.0, 0.0, 100.0, 100.0)}
+    check("one field per well is passed through untouched",
+          pool_well({0: [bx(10, 10, 4, 4), bx(50, 50, 6, 6)]}, {0: (0.0, 0.0, 100.0, 100.0)}),
+          ([bx(10, 10, 4, 4), bx(50, 50, 6, 6)], [(0, bx(10, 10, 4, 4)), (0, bx(50, 50, 6, 6))]))
+    check("a pooled box carries its well position and its field-local original",
+          pool_well({1: [bx(10, 20, 4, 4)]}, {1: (200.0, 300.0, 100.0, 100.0)}),
+          ([bx(210, 320, 4, 4)], [(1, bx(10, 20, 4, 4))]))
+    check("a cell both fields agree on is pooled once",
+          len(pool_well({0: [bx(93, 40, 4, 4)], 1: [bx(3, 40, 4, 4)]}, seam)[0]), 1)
+    check("one cell the two fields outline differently collapses to the lower field",
+          pool_well({0: [bx(92, 40, 4, 4)], 1: [bx(4, 40, 4, 4)]}, seam),
+          ([bx(92, 40, 4, 4)], [(0, bx(92, 40, 4, 4))]))
+    check("two distinct cells either side of the seam are both kept",
+          len(pool_well({0: [bx(90, 40, 4, 4)], 1: [bx(8, 40, 4, 4)]}, seam)[0]), 2)
+    check("distinct cells in different fields are both kept",
+          len(pool_well({0: [bx(20, 40, 4, 4)], 1: [bx(60, 40, 4, 4)]}, seam)[0]), 2)
 
     print("SURS + disjoint placement")
     check("oversized cell not eligible", eligible([bx(0, 0, 500, 500)], 100, 0.0, 0.0), [])
@@ -1441,7 +1626,7 @@ def run_tests():
     print("four overlapping fields per well (auto-skip)")
     if os.path.isdir(os.path.join(BABETTE_RESULTS, "TargetData")):
         res = curate(BABETTE_RESULTS, "Green:yes; Red:yes", fov_px=BABETTE_FOV)
-        origins = read_field_origins(
+        spans = read_field_spans(
             BABETTE_RESULTS, overview_pixel_size(overview_from_results(BABETTE_RESULTS)))
 
         # Regroup the per-site results into physical wells, moving each site's cells and
@@ -1450,7 +1635,7 @@ def run_tests():
         pooled, fields_per_well = {}, {}
         for w in res["wells"]:
             row, col, fld, z, tp = parse_site(w["site"])
-            ox, oy = origins[(row, col, fld, z, tp)]
+            ox, oy = spans[(row, col, fld, z, tp)][:2]
             fields_per_well.setdefault((row, col, z, tp), set()).add(fld)
             cur = pooled.setdefault((row, col, z, tp), {"cells": [], "tiles": []})
             cur["cells"] += [(b[0] + b[2] / 2.0 + ox, b[1] + b[3] / 2.0 + oy, fld)
