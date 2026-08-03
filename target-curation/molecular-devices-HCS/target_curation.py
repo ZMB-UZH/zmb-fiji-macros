@@ -107,7 +107,14 @@ def parse_site(site):
 
 
 def site_status(eligible_count, acquired_count, requested_count):
-    """Classify why a site did or did not reach the requested acquisition count."""
+    """Classify why a well did or did not reach the requested acquisition count.
+
+    `low_cells` is the ordinary shortfall - the well does not hold enough cells that can
+    be imaged whole with their margin. `constrained` means it held enough but they could
+    not all be acquired; since placement now swaps within a sampling frame and, failing
+    that, accepts overlap rather than dropping a cell, what remains is a well whose
+    sampling grid had fewer occupied frames than the count asked for, i.e. the cells are
+    there but not spread over enough of it."""
     if acquired_count >= requested_count:
         return "full"
     if eligible_count < requested_count:
@@ -665,9 +672,15 @@ def _surs_sample(elig, centre_x, centre_y, n, seed, search_boxes):
     unbiased picture of the well AREA (even spatial coverage) rather than of the cell
     population (which would over-weight dense regions). Fewer than n come back only
     where the well is sparse - an empty frame contributes nothing. Deterministic for
-    a seed."""
+    a seed.
+
+    Returns (chosen, alternates): the sampled cells, and for each of them the others
+    that shared its frame. The frame is the sampling unit and the cell inside it is
+    drawn at random, so any of those alternates is an equally valid draw - which is what
+    lets the placement swap one in when the drawn cell cannot be given a field of view
+    that clears the others, at no cost to the spatial distribution."""
     if len(elig) <= n:
-        return list(elig)
+        return list(elig), {}
 
     xs = [b[0] + b[2] / 2.0 for b in search_boxes]
     ys = [b[1] + b[3] / 2.0 for b in search_boxes]
@@ -698,7 +711,7 @@ def _surs_sample(elig, centre_x, centre_y, n, seed, search_boxes):
     chosen = []                                                # one random cell per occupied frame
     for key in sorted(frames):
         members = frames[key]
-        chosen.append(members[int(draw() * len(members))])
+        chosen.append((members[int(draw() * len(members))], members))
 
     # More frames than n can be occupied: rounding the grid dimensions can already
     # exceed n (n=5 on a roughly square well becomes a 2x3 grid), and the random
@@ -710,7 +723,8 @@ def _surs_sample(elig, centre_x, centre_y, n, seed, search_boxes):
         chosen[i], chosen[j] = chosen[j], chosen[i]
     if len(chosen) > n:
         chosen = chosen[:n]
-    return chosen
+    return ([pick for pick, _ in chosen],
+            dict((pick, [m for m in members if m != pick]) for pick, members in chosen))
 
 
 # --------------------------------------------------------------------------- #
@@ -756,6 +770,17 @@ def _clear_of(placed, x, y, fov):
                for t in placed)
 
 
+def _candidates(lo, hi, centres, fov):
+    """The points on one axis worth testing for a FOV centre inside [lo, hi]: the ends,
+    the midpoint, and the lines one FOV width from an already placed centre. Whether a
+    FOV clears the placed ones, and by how much it fails to, both change direction only
+    at those lines, so testing them is exact rather than a sampling of the window."""
+    out = [lo, hi, (lo + hi) / 2.0]
+    for c in centres:
+        out += [c - fov, c + fov]
+    return sorted(set(v for v in out if lo <= v <= hi))
+
+
 def _clear_point(window, placed, fov):
     """Where to put a FOV inside `window` so it overlaps none already placed, or None.
 
@@ -764,24 +789,16 @@ def _clear_point(window, placed, fov):
     window's own edges and by the lines one FOV width from a placed centre. If a clear
     point exists at all, one exists where those lines cross. Prefer the midpoint - it
     holds the group furthest from the FOV edge - and otherwise take the clear crossing
-    nearest to it, so a cell is only ever given up when its window is genuinely
-    covered rather than merely because the midpoint happened to be taken."""
+    nearest to it, so the window is declared covered only when it genuinely is rather
+    than merely because the midpoint happened to be taken."""
     x_lo, x_hi, y_lo, y_hi = window
     mid_x, mid_y = (x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0
     if _clear_of(placed, mid_x, mid_y, fov):
         return mid_x, mid_y
 
-    def crossings(lo, hi, centres):
-        out = [lo, hi, (lo + hi) / 2.0]
-        for c in centres:
-            out += [c - fov, c + fov]
-        return sorted(set(v for v in out if lo <= v <= hi))
-
-    xs = crossings(x_lo, x_hi, [t["cx"] for t in placed])
-    ys = crossings(y_lo, y_hi, [t["cy"] for t in placed])
     best = None
-    for x in xs:
-        for y in ys:
+    for x in _candidates(x_lo, x_hi, [t["cx"] for t in placed], fov):
+        for y in _candidates(y_lo, y_hi, [t["cy"] for t in placed], fov):
             if _clear_of(placed, x, y, fov):
                 reach = (x - mid_x) ** 2 + (y - mid_y) ** 2
                 if best is None or reach < best[0]:
@@ -789,15 +806,56 @@ def _clear_point(window, placed, fov):
     return (best[1], best[2]) if best else None
 
 
-def _place_disjoint(sampled, centre_x, centre_y, half_window, fov):
-    """Place disjoint FOVs over the sampled cells by greedy first-fit.
+def _overlap_area(placed, x, y, fov):
+    """How much ground a FOV centred at (x, y) would image a second time, summed over
+    the FOVs already placed. Zero exactly when it clears them all."""
+    total = 0.0
+    for t in placed:
+        wide = fov - abs(x - t["cx"])
+        high = fov - abs(y - t["cy"])
+        if wide > 0.0 and high > 0.0:
+            total += wide * high
+    return total
 
-    Walk the sampled cells; for each not-yet-covered one, build the FOV that frames
-    it and any further sampled cells that also fit (several per FOV is fine and free),
-    then put that FOV wherever in its feasible window it images no ground already
-    taken. A cell is left unimaged only when no such point exists. Greedy first-fit,
-    not a provably minimal cover, but the disjoint sample makes the two coincide in
-    practice. Returns [ {cx, cy, covered: [cell_index, ...]} ]."""
+
+def _least_overlap_point(window, placed, fov):
+    """Where to put a FOV inside `window` when no point in it clears the ones already
+    placed: the point that images the least ground twice, ties going to the one nearest
+    the midpoint so the group still sits as far from the FOV edge as it can.
+
+    Re-imaging ground is a real cost - more acquisitions, more data, and the same cells
+    photographed twice - so it is only ever paid where the caller has established there
+    is no alternative, and then at the smallest amount the window allows."""
+    x_lo, x_hi, y_lo, y_hi = window
+    mid_x, mid_y = (x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0
+    best = None
+    for x in _candidates(x_lo, x_hi, [t["cx"] for t in placed], fov):
+        for y in _candidates(y_lo, y_hi, [t["cy"] for t in placed], fov):
+            cost = (_overlap_area(placed, x, y, fov), (x - mid_x) ** 2 + (y - mid_y) ** 2)
+            if best is None or cost < best[0]:
+                best = (cost, x, y)
+    return (best[1], best[2]) if best else (mid_x, mid_y)
+
+
+def _place_disjoint(sampled, alternates, centre_x, centre_y, half_window, fov):
+    """Place FOVs over the sampled cells by greedy first-fit, disjoint wherever that is
+    possible at all.
+
+    Walk the sampled cells; for each not-yet-covered one, build the FOV that frames it
+    and any further sampled cells that also fit (several per FOV is fine and free), then
+    put that FOV wherever in its feasible window it images no ground already taken.
+
+    When no such point exists the count still has to be met, because a well is meant to
+    come back short only when it runs out of cells - not because the geometry of an
+    earlier FOV got in the way. So two things are tried before any ground is imaged
+    twice. First the other eligible cells that shared the drawn cell's sampling frame:
+    the frame is the sampling unit and the cell inside it was drawn at random, so
+    swapping to one that CAN be placed clear costs the sample nothing and keeps every
+    FOV disjoint. Only when no cell of that frame can be placed clear either is the
+    drawn cell placed anyway, at the point that images the least ground twice.
+
+    Greedy first-fit, not a provably minimal cover, but the spread sample makes the two
+    coincide in practice. Returns [ {cx, cy, covered: [cell_index, ...]} ]."""
     placed, covered = [], set()
     for cell in sampled:
         if cell in covered:
@@ -805,10 +863,20 @@ def _place_disjoint(sampled, centre_x, centre_y, half_window, fov):
 
         remaining = [i for i in sampled if i not in covered]
         group, window = _grow(cell, remaining, centre_x, centre_y, half_window)
-
         point = _clear_point(window, placed, fov)
+
         if point is None:
-            continue
+            for other in alternates.get(cell, []):
+                if other in covered or other not in half_window:
+                    continue
+                other_group, other_window = _grow(other, remaining, centre_x, centre_y,
+                                                  half_window)
+                other_point = _clear_point(other_window, placed, fov)
+                if other_point is not None:
+                    group, point = other_group, other_point
+                    break
+        if point is None:
+            point = _least_overlap_point(window, placed, fov)
 
         placed.append({"cx": point[0], "cy": point[1], "covered": sorted(group)})
         covered.update(group)
@@ -831,11 +899,17 @@ def select_and_place(cells, fov, stage_margin, neighbourhood, n, seed, search_bo
     centre_x = dict((i, cells[i][0] + cells[i][2] / 2.0) for i in elig)
     centre_y = dict((i, cells[i][1] + cells[i][3] / 2.0) for i in elig)
 
-    sampled = _surs_sample(elig, centre_x, centre_y, n, seed, search_boxes or cells)
+    sampled, alternates = _surs_sample(elig, centre_x, centre_y, n, seed,
+                                       search_boxes or cells)
 
-    # how far a FOV centre may sit from a cell's centre and still frame it + its margin
-    half_window = dict((i, half - cell_radius(cells[i]) * (1.0 + neighbourhood)) for i in sampled)
-    tiles = _place_disjoint(sampled, centre_x, centre_y, half_window, fov)
+    # how far a FOV centre may sit from a cell's centre and still frame it + its margin,
+    # for the drawn cells and for the frame-mates the placement may swap one of them for
+    considered = set(sampled)
+    for mates in alternates.values():
+        considered.update(mates)
+    half_window = dict((i, half - cell_radius(cells[i]) * (1.0 + neighbourhood))
+                       for i in considered)
+    tiles = _place_disjoint(sampled, alternates, centre_x, centre_y, half_window, fov)
 
     acquired = sorted(set(i for t in tiles for i in t["covered"]))
     return [cells[i] for i in acquired], tiles, len(elig)
@@ -1633,11 +1707,38 @@ def run_tests():
     check("far pair -> 2 disjoint FOVs", (len(tiles), disjoint(tiles, 100)), (2, True))
     # genuinely infeasible, not merely inconvenient: sample all three; A and B (70
     # apart, usable 60) cannot share a FOV, and B's whole feasible window lies within
-    # one FOV width of A's, so no placement of B clears A and B is given up.
+    # one FOV width of A's, so no placement of B clears A. All three cells are sampled,
+    # so all three are acquired: B's FOV is placed anyway, overlapping A's, because the
+    # count is only allowed to fall short when the cells run out. Nothing here can be
+    # swapped for it - each cell is its own frame - so overlap is the only way.
     got, tiles, _ = select_and_place([bx(0, 0, 4, 4), bx(70, 0, 4, 4), bx(1000, 0, 4, 4)],
                                      100, 0.2, 0.0, 3, 5)
-    check("cell given up only when its whole window is covered",
-          (len(tiles), disjoint(tiles, 100), set(b[0] for b in got)), (2, True, set([0.0, 1000.0])))
+    clashes = sum(1 for i, a in enumerate(tiles) for b in tiles[i + 1:]
+                  if abs(a["cx"] - b["cx"]) < 100 and abs(a["cy"] - b["cy"]) < 100)
+    check("a cell with no clear placement is imaged anyway, not given up",
+          (len(tiles), set(b[0] for b in got)), (3, set([0.0, 70.0, 1000.0])))
+    check("and it costs exactly one overlapping pair", clashes, 1)
+    framed = [t for t in tiles if abs(t["cx"] - 72.0) <= 27.2 and abs(t["cy"] - 2.0) <= 27.2]
+    check("the overlapping FOV still frames the cell it was placed for", len(framed), 1)
+    check("the overlap taken is the least the window allowed",
+          _overlap_area([{"cx": 2.0, "cy": 2.0}], framed[0]["cx"], framed[0]["cy"], 100)
+          <= _overlap_area([{"cx": 2.0, "cy": 2.0}], 72.0, 2.0, 100), True)
+
+    # ...but overlapping is the last resort, not the first. Cell 1's window lies wholly
+    # within one FOV of cell 0, while its frame-mate cell 2's does not; the mate is an
+    # equally valid draw from that frame, so it is taken and both FOVs stay disjoint.
+    swap_cells = [bx(-20, -20, 40, 40), bx(40, -20, 40, 40), bx(130, -20, 40, 40)]
+    swap_hw = dict((i, 50.0 - cell_radius(swap_cells[i])) for i in range(3))
+    swap_x = dict((i, swap_cells[i][0] + 20.0) for i in range(3))
+    swap_y = dict((i, swap_cells[i][1] + 20.0) for i in range(3))
+    swapped = _place_disjoint([0, 1], {1: [2]}, swap_x, swap_y, swap_hw, 100.0)
+    check("a frame-mate is swapped in before any ground is imaged twice",
+          (len(swapped), disjoint(swapped, 100.0),
+           sorted(i for t in swapped for i in t["covered"])), (2, True, [0, 2]))
+    no_mate = _place_disjoint([0, 1], {}, swap_x, swap_y, swap_hw, 100.0)
+    check("with no frame-mate available the cell is imaged with overlap instead",
+          (len(no_mate), disjoint(no_mate, 100.0),
+           sorted(i for t in no_mate for i in t["covered"])), (2, False, [0, 1]))
     # ...whereas a cell whose window merely straddles a placed FOV is shifted clear
     # rather than dropped: centres 88 apart with a window of +/-27 around each, so the
     # midpoint sits 88 from the placed FOV (too close) but x = 102 is both a full FOV
@@ -1659,7 +1760,7 @@ def run_tests():
     in_clump = set(range(len(bg), len(mixed)))
     cx = dict((i, mixed[i][0] + 0.5) for i in range(len(mixed)))
     cy = dict((i, mixed[i][1] + 0.5) for i in range(len(mixed)))
-    per_trial = [sum(1 for i in _surs_sample(list(range(len(mixed))), cx, cy, 25, sd, mixed) if i in in_clump)
+    per_trial = [sum(1 for i in _surs_sample(list(range(len(mixed))), cx, cy, 25, sd, mixed)[0] if i in in_clump)
                  for sd in range(100)]
     clump_frac = sum(per_trial) / 100.0 / 25.0
     print("    clump share of sample = %.0f%% (its cells are 80%% of all; per-cell would be ~80%%)"
@@ -1674,7 +1775,7 @@ def run_tests():
     mid_x = (min(lx.values()) + max(lx.values())) / 2.0
     mid_y = (min(ly.values()) + max(ly.values())) / 2.0
     picks = [i for sd in range(400)
-             for i in _surs_sample(list(range(len(lattice))), lx, ly, 5, sd, lattice)]
+             for i in _surs_sample(list(range(len(lattice))), lx, ly, 5, sd, lattice)[0]]
     near_x = sum(1 for i in picks if lx[i] < mid_x)
     near_y = sum(1 for i in picks if ly[i] < mid_y)
     print("    halves took %d / %d (x) and %d / %d (y) of %d picks; equal area -> half"
@@ -1953,10 +2054,14 @@ def run_tests():
               % (len(pooled), sorted(set(len(v) for v in fields_per_well.values())),
                  sum(len(w["cells"]) for w in pooled.values()),
                  sum(len(w["tiles"]) for w in pooled.values())))
+        short = [w["site"] for w in res["wells"] if w["status"] == "constrained"]
         check("more than one field per well", max(len(v) for v in fields_per_well.values()) > 1, True)
         check("no cell is acquired from two fields of one well", duplicates, 0)
-        check("no two FOVs of one well overlap", xfield, 0)
         check("no well exceeds the requested cell count", over_target, 0)
+        # FOVs may now overlap where that was the only way to reach the requested count,
+        # so what must hold is the reason a well falls short: never the placement.
+        check("no well falls short while it still has cells to give", short, [])
+        print("    cross-field FOV overlaps (allowed only as a last resort) = %d" % xfield)
     else:
         print("  SKIP (dataset not present)")
 
